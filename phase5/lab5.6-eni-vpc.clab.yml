@@ -1,0 +1,142 @@
+# Lab 5.6 — ENI Simulation in VPC Context
+#
+# Topology: 3-tier app with ENI isolation, failover, security groups simulation
+#
+#  Subnet-Public  (10.0.1.0/24) — NAT/bastion layer
+#  Subnet-App     (10.0.2.0/24) — Application layer
+#  Subnet-DB      (10.0.3.0/24) — Database layer
+#
+# Each "instance" has ENIs in different subnets, simulating AWS multi-homing.
+# Database failover is demonstrated by moving a floating IP between instances.
+#
+# Deploy: sudo containerlab deploy -t lab5.6-eni-vpc.clab.yml
+
+name: lab5-6-eni-vpc
+
+topology:
+  nodes:
+    # ── VPC Router (simulates AWS VPC routing) ─────────────────
+    vpc-router:
+      kind: linux
+      image: frrouting/frr:latest
+      exec:
+        - sysctl -w net.ipv4.ip_forward=1
+        - ip link set eth1 up
+        - ip link set eth2 up
+        - ip link set eth3 up
+        # Each interface is a subnet gateway
+        - ip addr add 10.0.1.254/24 dev eth1   # Public subnet
+        - ip addr add 10.0.2.254/24 dev eth2   # App subnet
+        - ip addr add 10.0.3.254/24 dev eth3   # DB subnet
+
+    # ── NAT / Bastion Host (2 ENIs: public + app subnet) ───────
+    nat-instance:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip link set eth1 up
+        - ip link set eth2 up
+        # ENI-1: public subnet
+        - ip addr add 10.0.1.10/24 dev eth1
+        - ip route add default via 10.0.1.254
+        # ENI-2: app subnet (for routing between subnets)
+        - ip addr add 10.0.2.10/24 dev eth2
+        - sysctl -w net.ipv4.ip_forward=1
+        # Simulate Elastic IP (10.0.1.100 floats to this instance)
+        - ip addr add 10.0.1.100/32 dev eth1
+
+    # ── App Server (ENI in app subnet) ─────────────────────────
+    app-server:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip link set eth1 up
+        - ip addr add 10.0.2.20/24 dev eth1
+        - ip route add default via 10.0.2.254
+        - ip route add 10.0.1.0/24 via 10.0.2.254
+        - ip route add 10.0.3.0/24 via 10.0.2.254
+
+    # ── DB Primary (ENI in db subnet) ──────────────────────────
+    db-primary:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip link set eth1 up
+        - ip addr add 10.0.3.10/24 dev eth1
+        - ip route add default via 10.0.3.254
+        # "Floating DB IP" — starts on db-primary
+        # Simulates RDS / database cluster floating endpoint
+        - ip addr add 10.0.3.100/32 dev eth1
+
+    # ── DB Standby (ENI in db subnet, ready for failover) ──────
+    db-standby:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip link set eth1 up
+        - ip addr add 10.0.3.20/24 dev eth1
+        - ip route add default via 10.0.3.254
+
+    # ── External client ────────────────────────────────────────
+    external-client:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip link set eth1 up
+        - ip addr add 10.0.1.50/24 dev eth1
+        - ip route add default via 10.0.1.254
+        - ip route add 10.0.2.0/24 via 10.0.1.254
+        - ip route add 10.0.3.0/24 via 10.0.1.254
+
+  links:
+    # Public subnet (eth1 of vpc-router)
+    - endpoints: ["nat-instance:eth1",     "vpc-router:eth1"]
+    - endpoints: ["external-client:eth1",  "vpc-router:eth1"]
+    # App subnet (eth2 of vpc-router)
+    - endpoints: ["nat-instance:eth2",     "vpc-router:eth2"]
+    - endpoints: ["app-server:eth1",       "vpc-router:eth2"]
+    # DB subnet (eth3 of vpc-router)
+    - endpoints: ["db-primary:eth1",       "vpc-router:eth3"]
+    - endpoints: ["db-standby:eth1",       "vpc-router:eth3"]
+
+# -------------------------------------------------------------
+# EXERCISES — ENI Patterns & Failover
+# -------------------------------------------------------------
+#
+# SCENARIO A: Normal traffic flow (3-tier app)
+# 1. External client → NAT instance → App server:
+#      docker exec clab-lab5-6-eni-vpc-external-client ping 10.0.2.20
+#
+# 2. App server → Database (via floating IP):
+#      docker exec clab-lab5-6-eni-vpc-app-server ping 10.0.3.100
+#    Notice it hits db-primary (10.0.3.10)
+#
+# SCENARIO B: Database failover (ENI floating IP movement)
+# 3. Simulate db-primary failure — remove floating IP:
+#      docker exec clab-lab5-6-eni-vpc-db-primary \
+#        ip addr del 10.0.3.100/32 dev eth1
+#
+# 4. Assign floating IP to db-standby (ENI reassociation):
+#      docker exec clab-lab5-6-eni-vpc-db-standby \
+#        ip addr add 10.0.3.100/32 dev eth1
+#
+# 5. App server immediately reaches new DB — no DNS change needed:
+#      docker exec clab-lab5-6-eni-vpc-app-server ping 10.0.3.100
+#    Now hits db-standby (10.0.3.20)
+#
+# SCENARIO C: Elastic IP reassignment (NAT failover)
+# 6. Move Elastic IP 10.0.1.100 to a new instance:
+#      docker exec clab-lab5-6-eni-vpc-nat-instance \
+#        ip addr del 10.0.1.100/32 dev eth1
+#      docker exec clab-lab5-6-eni-vpc-external-client \
+#        ip addr add 10.0.1.100/32 dev eth1
+#    The "Elastic IP" is now on external-client.
+#
+# SCENARIO D: Security group simulation
+# 7. Block DB port from app-server (iptables = security group):
+#      docker exec clab-lab5-6-eni-vpc-db-primary \
+#        iptables -A INPUT -s 10.0.2.20 -p tcp --dport 5432 -j DROP
+#
+# 8. Allow ICMP but block TCP — shows per-protocol SG rules:
+#      docker exec clab-lab5-6-eni-vpc-app-server ping 10.0.3.10    # still works
+#      docker exec clab-lab5-6-eni-vpc-app-server nc -zv 10.0.3.10 5432  # blocked

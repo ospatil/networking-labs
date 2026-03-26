@@ -1,0 +1,192 @@
+# Lab 5.4 — Transit Virtual Interface with Transit Gateway (TGW)
+#
+# Transit VIF allows one DX connection to reach MULTIPLE VPCs
+# via a Transit Gateway — instead of needing a separate VGW per VPC.
+#
+# Architecture:
+#
+#  [on-prem-router] == VLAN 300 (transit VIF) ==> [aws-edge] --> [tgw]
+#                                                                   |
+#                                              ┌────────────────────┼────────────────────┐
+#                                           [vpc-a]             [vpc-b]              [vpc-c]
+#                                         10.0.1.0/24         10.0.2.0/24          10.0.3.0/24
+#
+# Key differences vs Private VIF:
+#   - Transit VIF connects to TGW, not VGW
+#   - TGW BGP ASN is always 64512 (AWS reserved)
+#   - TGW has its own route tables — you control which VPCs are reachable
+#   - Single DX connection serves all VPCs attached to the TGW
+#   - On-prem advertises its prefix once; TGW propagates to all VPC route tables
+#
+# Deploy: sudo containerlab deploy -t lab5.4-transit-vif.clab.yml
+
+name: lab5-4-transit-vif
+
+topology:
+  nodes:
+    on-prem-router:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - tgw-configs/on-prem-tgw.conf:/etc/frr/frr.conf
+        - configs/daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up
+        # Transit VIF on VLAN 300
+        - ip link add link eth1 name eth1.300 type vlan id 300
+        - ip link set eth1.300 up
+        - ip addr add 169.254.300.1/30 dev eth1.300
+        # On-prem aggregate (covers all on-prem subnets)
+        - ip addr add 10.100.0.0/22 dev lo
+        - ip link set lo up
+        - sysctl -w net.ipv4.ip_forward=1
+
+    aws-edge:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - tgw-configs/aws-edge-tgw.conf:/etc/frr/frr.conf
+        - configs/daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up
+        - ip link set eth2 up
+        # Transit VIF termination
+        - ip link add link eth1 name eth1.300 type vlan id 300
+        - ip link set eth1.300 up
+        - ip addr add 169.254.300.2/30 dev eth1.300
+        # Link to TGW
+        - ip addr add 10.200.0.1/30 dev eth2
+        - sysctl -w net.ipv4.ip_forward=1
+
+    # Transit Gateway
+    # Real world: AWS-managed, has attachment per VPC and per DX VIF
+    # We simulate with FRR acting as a route reflector / hub router
+    tgw:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - tgw-configs/tgw.conf:/etc/frr/frr.conf
+        - configs/daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up   # to aws-edge
+        - ip link set eth2 up   # to vpc-a
+        - ip link set eth3 up   # to vpc-b
+        - ip link set eth4 up   # to vpc-c
+        - ip addr add 10.200.0.2/30 dev eth1
+        - ip addr add 10.200.1.1/30 dev eth2
+        - ip addr add 10.200.2.1/30 dev eth3
+        - ip addr add 10.200.3.1/30 dev eth4
+        - sysctl -w net.ipv4.ip_forward=1
+
+    # VPC-A gateway + EC2
+    vpc-a-gw:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - tgw-configs/vpc-a-gw.conf:/etc/frr/frr.conf
+        - configs/daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up
+        - ip link set eth2 up
+        - ip addr add 10.200.1.2/30 dev eth1
+        - ip addr add 10.0.1.254/24 dev eth2
+        - sysctl -w net.ipv4.ip_forward=1
+
+    ec2-vpc-a:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip link set eth1 up
+        - ip addr add 10.0.1.10/24 dev eth1
+        - ip route add default via 10.0.1.254
+
+    # VPC-B gateway + EC2
+    vpc-b-gw:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - tgw-configs/vpc-b-gw.conf:/etc/frr/frr.conf
+        - configs/daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up
+        - ip link set eth2 up
+        - ip addr add 10.200.2.2/30 dev eth1
+        - ip addr add 10.0.2.254/24 dev eth2
+        - sysctl -w net.ipv4.ip_forward=1
+
+    ec2-vpc-b:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip link set eth1 up
+        - ip addr add 10.0.2.10/24 dev eth1
+        - ip route add default via 10.0.2.254
+
+    # VPC-C gateway + EC2
+    vpc-c-gw:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - tgw-configs/vpc-c-gw.conf:/etc/frr/frr.conf
+        - configs/daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up
+        - ip link set eth2 up
+        - ip addr add 10.200.3.2/30 dev eth1
+        - ip addr add 10.0.3.254/24 dev eth2
+        - sysctl -w net.ipv4.ip_forward=1
+
+    ec2-vpc-c:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip link set eth1 up
+        - ip addr add 10.0.3.10/24 dev eth1
+        - ip route add default via 10.0.3.254
+
+  links:
+    - endpoints: ["on-prem-router:eth1",  "aws-edge:eth1"]
+    - endpoints: ["aws-edge:eth2",        "tgw:eth1"]
+    - endpoints: ["tgw:eth2",             "vpc-a-gw:eth1"]
+    - endpoints: ["tgw:eth3",             "vpc-b-gw:eth1"]
+    - endpoints: ["tgw:eth4",             "vpc-c-gw:eth1"]
+    - endpoints: ["vpc-a-gw:eth2",        "ec2-vpc-a:eth1"]
+    - endpoints: ["vpc-b-gw:eth2",        "ec2-vpc-b:eth1"]
+    - endpoints: ["vpc-c-gw:eth2",        "ec2-vpc-c:eth1"]
+
+# -------------------------------------------------------------
+# EXERCISES
+# -------------------------------------------------------------
+# 1. Verify Transit VIF BGP session:
+#      docker exec -it clab-lab5-4-transit-vif-on-prem-router \
+#        vtysh -c "show bgp summary"
+#
+# 2. Check TGW routing table — should have all 3 VPC CIDRs + on-prem:
+#      docker exec -it clab-lab5-4-transit-vif-tgw \
+#        vtysh -c "show ip route"
+#
+# 3. On-prem reaches ALL THREE VPCs via single DX connection:
+#      docker exec clab-lab5-4-transit-vif-on-prem-router ping 10.0.1.10
+#      docker exec clab-lab5-4-transit-vif-on-prem-router ping 10.0.2.10
+#      docker exec clab-lab5-4-transit-vif-on-prem-router ping 10.0.3.10
+#
+# 4. TGW ROUTE TABLE ISOLATION EXERCISE:
+#    In real AWS, TGW route tables control which VPCs can talk to each other.
+#    Simulate blocking VPC-A from reaching VPC-B (isolation):
+#      docker exec -it clab-lab5-4-transit-vif-tgw vtysh
+#      conf t
+#      ip prefix-list BLOCK-VPC-B deny 10.0.2.0/24
+#      ip prefix-list BLOCK-VPC-B permit any
+#      router bgp 64512
+#       address-family ipv4 unicast
+#        neighbor 10.200.1.2 prefix-list BLOCK-VPC-B out
+#      end
+#      clear bgp 10.200.1.2 soft out
+#
+#    VPC-A can no longer reach VPC-B, but on-prem still can:
+#      docker exec clab-lab5-4-transit-vif-ec2-vpc-a ping 10.0.2.10  # BLOCKED
+#      docker exec clab-lab5-4-transit-vif-on-prem-router ping 10.0.2.10  # works
+#
+# 5. Traceroute from on-prem to each VPC — notice all paths go through TGW:
+#      docker exec clab-lab5-4-transit-vif-on-prem-router traceroute 10.0.1.10
+#      docker exec clab-lab5-4-transit-vif-on-prem-router traceroute 10.0.3.10

@@ -1,0 +1,172 @@
+# Lab 6.3 — Monitoring and Troubleshooting
+#
+# Covers the operational side: how to monitor BGP, detect failures,
+# analyse flows, and work through the most common DX/BGP issues.
+#
+# This lab is structured differently — it's a FAULT INJECTION lab.
+# You deploy a working topology, then intentionally break things
+# and practice diagnosing and fixing each fault.
+#
+# Topology: the same private VIF topology from lab 5.2, intentionally
+# misconfigured in several ways that you'll find and fix.
+#
+# Deploy: sudo containerlab deploy -t lab6.3-troubleshooting.clab.yml
+
+name: lab6-3-troubleshoot
+
+topology:
+  nodes:
+    on-prem-router:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - configs/on-prem-broken.conf:/etc/frr/frr.conf
+        - configs/daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up
+        - ip link add link eth1 name eth1.100 type vlan id 100
+        - ip link set eth1.100 up
+        - ip addr add 169.254.100.1/30 dev eth1.100
+        - ip addr add 10.100.0.0/24 dev lo
+        - ip link set lo up
+        - sysctl -w net.ipv4.ip_forward=1
+
+    aws-edge:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - configs/aws-edge-broken.conf:/etc/frr/frr.conf
+        - configs/daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up
+        - ip link set eth2 up
+        - ip link add link eth1 name eth1.100 type vlan id 100
+        - ip link set eth1.100 up
+        - ip addr add 169.254.100.2/30 dev eth1.100
+        - ip addr add 10.200.0.1/30 dev eth2
+        - sysctl -w net.ipv4.ip_forward=1
+
+    vpc-gw:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - configs/vpc-gw-broken.conf:/etc/frr/frr.conf
+        - configs/daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up
+        - ip link set eth2 up
+        - ip addr add 10.200.0.2/30 dev eth1
+        - ip addr add 10.0.0.254/24 dev eth2
+        - sysctl -w net.ipv4.ip_forward=1
+
+    ec2:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip link set eth1 up
+        - ip addr add 10.0.0.10/24 dev eth1
+        - ip route add default via 10.0.0.254
+
+  links:
+    - endpoints: ["on-prem-router:eth1", "aws-edge:eth1"]
+    - endpoints: ["aws-edge:eth2",       "vpc-gw:eth1"]
+    - endpoints: ["vpc-gw:eth2",         "ec2:eth1"]
+
+# -------------------------------------------------------------
+# FAULT INJECTION SCENARIOS — work through these in order
+# -------------------------------------------------------------
+# After deploying, on-prem-router CANNOT reach EC2.
+# Use the troubleshooting commands below to find and fix each fault.
+# The broken configs in configs/on-prem-broken.conf etc. contain
+# deliberate errors — see configs/FAULTS.md for the answer key.
+#
+# ── TROUBLESHOOTING TOOLKIT ──────────────────────────────────
+#
+# STEP 1 — Is the BGP session up?
+#   docker exec -it clab-lab6-3-troubleshoot-on-prem-router \
+#     vtysh -c "show bgp summary"
+#   States: Idle → Connect → Active → OpenSent → OpenConfirm → Established
+#   "Active" = TCP not connecting (wrong IP, wrong port, ACL blocking)
+#   "OpenSent"/"OpenConfirm" = TCP ok, BGP negotiation failing (wrong ASN, auth)
+#
+# STEP 2 — If session is down, is TCP port 179 reachable?
+#   docker exec clab-lab6-3-troubleshoot-on-prem-router \
+#     nc -zv 169.254.100.2 179
+#
+# STEP 3 — Can we ping the BGP peer IP?
+#   docker exec clab-lab6-3-troubleshoot-on-prem-router \
+#     ping -c3 169.254.100.2
+#
+# STEP 4 — If session is Established but no routes, check advertisements:
+#   docker exec -it clab-lab6-3-troubleshoot-on-prem-router \
+#     vtysh -c "show bgp ipv4 unicast neighbors 169.254.100.2 advertised-routes"
+#   docker exec -it clab-lab6-3-troubleshoot-on-prem-router \
+#     vtysh -c "show bgp ipv4 unicast neighbors 169.254.100.2 received-routes"
+#
+# STEP 5 — Is the prefix in the local routing table but not being advertised?
+#   docker exec -it clab-lab6-3-troubleshoot-on-prem-router \
+#     vtysh -c "show ip route 10.100.0.0/24"
+#   (prefix must exist in RIB to be advertised via "network" statement)
+#
+# STEP 6 — Are routes making it all the way to vpc-gw?
+#   docker exec -it clab-lab6-3-troubleshoot-vpc-gw \
+#     vtysh -c "show ip route"
+#
+# STEP 7 — Is EC2 reachable from vpc-gw?
+#   docker exec clab-lab6-3-troubleshoot-vpc-gw ping 10.0.0.10
+#
+# STEP 8 — Packet-level: watch for packets arriving (or not):
+#   docker exec -it clab-lab6-3-troubleshoot-aws-edge \
+#     tcpdump -i eth1.100 -n icmp
+#
+# ── COMMON FAULTS AND SIGNATURES ─────────────────────────────
+#
+# FAULT: Wrong remote-as configured
+#   Symptom: BGP stuck in "Active" or "OpenSent", logs show "Bad peer AS"
+#   Fix: match remote-as to the actual peer's AS number
+#
+# FAULT: Wrong BGP peer IP
+#   Symptom: BGP "Active", TCP never connects, ping to peer IP fails
+#   Fix: verify peer IP matches the address on the other router's subinterface
+#
+# FAULT: Network statement for non-existent prefix
+#   Symptom: BGP Established but "no routes" advertised
+#   Fix: ensure the prefix exists in the routing table (add to loopback)
+#
+# FAULT: Missing "activate" in address-family
+#   Symptom: BGP Established, neighbor shows but no routes exchanged
+#   Fix: add "neighbor <IP> activate" under address-family ipv4 unicast
+#
+# FAULT: IP forwarding disabled on router
+#   Symptom: BGP works, routes installed, but ping fails end-to-end
+#   Fix: sysctl -w net.ipv4.ip_forward=1
+#
+# FAULT: Missing default gateway on EC2
+#   Symptom: on-prem can ping vpc-gw but not EC2
+#   Fix: ip route add default via 10.0.0.254 on EC2
+#
+# FAULT: VLAN mismatch on trunk
+#   Symptom: ping to BGP peer IP fails, tcpdump shows untagged frames
+#   Fix: ensure both ends use same VLAN ID on subinterface
+#
+# ── MONITORING COMMANDS ──────────────────────────────────────
+#
+# BGP session uptime and prefix counts:
+#   vtysh -c "show bgp summary"
+#
+# BGP notification messages (why session went down):
+#   vtysh -c "show bgp neighbors 169.254.100.2" | grep -A5 "Last notification"
+#
+# Watch BGP updates in real time:
+#   vtysh -c "debug bgp updates" && vtysh -c "debug bgp keepalives"
+#   tail -f /var/log/frr/bgpd.log
+#
+# Interface stats (drops, errors):
+#   ip -s link show eth1
+#   ip -s link show eth1.100
+#
+# Flow summary (requires nfacct or ss):
+#   ss -tunp   # active TCP/UDP sockets
+#
+# Continuous ping with timestamps:
+#   ping -D -i 0.2 10.0.0.10

@@ -1,0 +1,139 @@
+# Lab 5.2 — Direct Connect Private VIF Simulation
+#
+# Topology (mirrors real AWS DX architecture):
+#
+#  [on-prem-router] --trunk--> [dx-location] --trunk--> [aws-edge-router]
+#                                                               |
+#                                                        [vpc-gateway]
+#                                                               |
+#                                                       [ec2-instance]
+#
+# VLAN 100 = Private VIF (on-prem <-> VPC private IPs)
+# BGP ASNs:
+#   on-prem-router : AS 65001  (customer)
+#   aws-edge-router: AS 64512  (AWS — reserved private ASN)
+#
+# Deploy: sudo containerlab deploy -t lab5.2-private-vif.clab.yml
+
+name: lab5-2-private-vif
+
+topology:
+  nodes:
+    # ── Customer Side ──────────────────────────────────────────
+    on-prem-router:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - configs/on-prem-router.conf:/etc/frr/frr.conf
+        - configs/daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up
+        # VLAN 100 subinterface (Private VIF)
+        - ip link add link eth1 name eth1.100 type vlan id 100
+        - ip link set eth1.100 up
+        # BGP peering IP (link-local /30 between customer and AWS)
+        - ip addr add 169.254.100.1/30 dev eth1.100
+        # On-prem network (what we'll advertise to AWS)
+        - ip addr add 10.100.0.0/24 dev lo
+        - ip link set lo up
+        - sysctl -w net.ipv4.ip_forward=1
+
+    # ── DX Location (cross-connect — pass-through, no config) ──
+    dx-location:
+      kind: linux
+      image: frrouting/frr:latest
+      exec:
+        - ip link set eth1 up
+        - ip link set eth2 up
+        # Act as transparent L2 bridge for the trunk
+        - ip link add name br0 type bridge vlan_filtering 1
+        - ip link set br0 up
+        - ip link set eth1 master br0
+        - ip link set eth2 master br0
+        - bridge vlan add vid 100 dev eth1
+        - bridge vlan add vid 100 dev eth2
+        - bridge vlan del vid 1  dev eth1
+        - bridge vlan del vid 1  dev eth2
+
+    # ── AWS Side ───────────────────────────────────────────────
+    aws-edge-router:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - configs/aws-edge-router.conf:/etc/frr/frr.conf
+        - configs/daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up
+        - ip link set eth2 up
+        # VLAN 100 subinterface (Private VIF termination)
+        - ip link add link eth1 name eth1.100 type vlan id 100
+        - ip link set eth1.100 up
+        - ip addr add 169.254.100.2/30 dev eth1.100
+        # Link to VGW/TGW (internal AWS backbone)
+        - ip addr add 10.200.0.1/30 dev eth2
+        - sysctl -w net.ipv4.ip_forward=1
+
+    # ── Virtual Private Gateway (VGW) ──────────────────────────
+    vpc-gateway:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - configs/vpc-gateway.conf:/etc/frr/frr.conf
+        - configs/daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up
+        - ip link set eth2 up
+        - ip addr add 10.200.0.2/30 dev eth1   # link to aws-edge
+        - ip addr add 10.0.0.254/24 dev eth2   # VPC subnet gateway
+        - sysctl -w net.ipv4.ip_forward=1
+
+    # ── Simulated EC2 Instance ─────────────────────────────────
+    ec2-instance:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip link set eth1 up
+        - ip addr add 10.0.0.10/24 dev eth1
+        - ip route add default via 10.0.0.254
+        # Simulate a small web service
+        - python3 -m http.server 80 &
+
+  links:
+    # on-prem --> DX location (trunk with VLAN 100)
+    - endpoints: ["on-prem-router:eth1",  "dx-location:eth1"]
+    # DX location --> AWS edge (trunk with VLAN 100)
+    - endpoints: ["dx-location:eth2",     "aws-edge-router:eth1"]
+    # AWS edge --> VGW (internal backbone)
+    - endpoints: ["aws-edge-router:eth2", "vpc-gateway:eth1"]
+    # VGW --> EC2 instance (VPC subnet)
+    - endpoints: ["vpc-gateway:eth2",     "ec2-instance:eth1"]
+
+# -------------------------------------------------------------
+# EXERCISES
+# -------------------------------------------------------------
+# 1. Verify BGP session comes up on the Private VIF:
+#      docker exec -it clab-lab5-2-private-vif-on-prem-router \
+#        vtysh -c "show bgp summary"
+#    Look for "Established" state with peer 169.254.100.2
+#
+# 2. Check what prefixes on-prem is advertising to AWS:
+#      docker exec -it clab-lab5-2-private-vif-on-prem-router \
+#        vtysh -c "show bgp ipv4 unicast neighbors 169.254.100.2 advertised-routes"
+#
+# 3. Check what AWS is advertising to on-prem (VPC CIDR):
+#      docker exec -it clab-lab5-2-private-vif-on-prem-router \
+#        vtysh -c "show bgp ipv4 unicast neighbors 169.254.100.2 received-routes"
+#
+# 4. Test full end-to-end connectivity (on-prem → EC2):
+#      docker exec clab-lab5-2-private-vif-on-prem-router ping 10.0.0.10
+#
+# 5. Trace the path — you should see it traverse all 4 hops:
+#      docker exec clab-lab5-2-private-vif-on-prem-router traceroute 10.0.0.10
+#
+# 6. Capture traffic on the Private VIF VLAN:
+#      docker exec -it clab-lab5-2-private-vif-dx-location \
+#        tcpdump -i br0 -n -e vlan 100
+#
+# 7. Simulate DX link failure — remove the BGP neighbor and observe convergence:
+#      docker exec -it clab-lab5-2-private-vif-on-prem-router \
+#        vtysh -c "conf t" -c "router bgp 65001" -c "no neighbor 169.254.100.2"

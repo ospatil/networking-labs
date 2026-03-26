@@ -1,0 +1,90 @@
+# Lab 2.1 — Basic VLANs (Access Ports)
+# Two VLANs on one FRR switch. Hosts in same VLAN can ping; cross-VLAN is blocked.
+# Deploy: sudo containerlab deploy -t lab2.1-vlans.clab.yml
+
+name: lab2-1-vlans
+
+topology:
+  nodes:
+    # FRRouting acts as an L2/L3 switch here
+    sw1:
+      kind: linux
+      image: frrouting/frr:latest
+      exec:
+        # Create VLAN-aware bridge
+        - ip link add name br0 type bridge vlan_filtering 1
+        - ip link set br0 up
+        # Add ports to bridge
+        - ip link set eth1 master br0
+        - ip link set eth2 master br0
+        - ip link set eth3 master br0
+        - ip link set eth4 master br0
+        # Set access VLANs (pvid = untagged ingress VLAN)
+        # eth1 & eth2 → VLAN 10 (Sales)
+        - bridge vlan add vid 10 dev eth1 pvid untagged
+        - bridge vlan del vid 1  dev eth1
+        - bridge vlan add vid 10 dev eth2 pvid untagged
+        - bridge vlan del vid 1  dev eth2
+        # eth3 & eth4 → VLAN 20 (Engineering)
+        - bridge vlan add vid 20 dev eth3 pvid untagged
+        - bridge vlan del vid 1  dev eth3
+        - bridge vlan add vid 20 dev eth4 pvid untagged
+        - bridge vlan del vid 1  dev eth4
+
+    # VLAN 10 hosts (Sales)
+    sales1:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip addr add 10.10.0.1/24 dev eth1
+        - ip link set eth1 up
+
+    sales2:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip addr add 10.10.0.2/24 dev eth1
+        - ip link set eth1 up
+
+    # VLAN 20 hosts (Engineering)
+    eng1:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip addr add 10.20.0.1/24 dev eth1
+        - ip link set eth1 up
+
+    eng2:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip addr add 10.20.0.2/24 dev eth1
+        - ip link set eth1 up
+
+  links:
+    - endpoints: ["sales1:eth1", "sw1:eth1"]
+    - endpoints: ["sales2:eth1", "sw1:eth2"]
+    - endpoints: ["eng1:eth1",   "sw1:eth3"]
+    - endpoints: ["eng2:eth1",   "sw1:eth4"]
+
+# -------------------------------------------------------------
+# EXERCISES
+# -------------------------------------------------------------
+# 1. Verify intra-VLAN works (should succeed):
+#      docker exec -it clab-lab2-1-vlans-sales1 ping 10.10.0.2
+#      docker exec -it clab-lab2-1-vlans-eng1   ping 10.20.0.2
+#
+# 2. Verify inter-VLAN is blocked (should fail — no router!):
+#      docker exec -it clab-lab2-1-vlans-sales1 ping 10.20.0.1
+#
+# 3. View VLAN table on the switch:
+#      docker exec -it clab-lab2-1-vlans-sw1 bridge vlan show
+#
+# 4. See MAC table per VLAN:
+#      docker exec -it clab-lab2-1-vlans-sw1 bridge fdb show
+#
+# 5. Key insight: VLANs create separate broadcast domains.
+#    ARP from sales1 is NOT seen by eng1 — confirm with tcpdump:
+#      docker exec -it clab-lab2-1-vlans-eng1 tcpdump -i eth1 -n arp &
+#      docker exec -it clab-lab2-1-vlans-sales1 ping 10.10.0.2
+#    (eng1 sees nothing!)

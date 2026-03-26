@@ -1,0 +1,143 @@
+# Lab 3.3 — Virtual Network Interfaces (ENI Simulation)
+# Demonstrates: interface hot-attach/detach, floating IPs, failover
+# This lab uses helper scripts — see the eni-scripts/ folder.
+# Deploy: sudo containerlab deploy -t lab3.3-eni.clab.yml
+
+name: lab3-3-eni
+
+topology:
+  nodes:
+    # Simulates the VPC subnet router/switch
+    vpc-router:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip link set eth1 up
+        - ip link set eth2 up
+        - ip addr add 172.16.1.254/24 dev eth1
+        - ip addr add 172.16.2.254/24 dev eth2
+        - sysctl -w net.ipv4.ip_forward=1
+
+    # "EC2 instance" — primary ENI on subnet-1, secondary ENI on subnet-2
+    instance-a:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip link set eth1 up
+        - ip link set eth2 up
+        # Primary ENI (eth1) — Subnet 1
+        - ip addr add 172.16.1.10/24 dev eth1
+        - ip route add default via 172.16.1.254 dev eth1
+        # Secondary ENI (eth2) — Subnet 2 (simulates multi-subnet instance)
+        - ip addr add 172.16.2.10/24 dev eth2
+        # Secondary IPs on primary ENI (simulates multiple private IPs)
+        - ip addr add 172.16.1.11/24 dev eth1
+        - ip addr add 172.16.1.12/24 dev eth1
+
+    # Second "EC2 instance" for failover demonstration
+    instance-b:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip link set eth1 up
+        - ip addr add 172.16.1.20/24 dev eth1
+        - ip route add default via 172.16.1.254 dev eth1
+
+    # Client to test connectivity
+    client:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip link set eth1 up
+        - ip addr add 172.16.1.100/24 dev eth1
+        - ip route add default via 172.16.1.254
+
+  links:
+    - endpoints: ["instance-a:eth1",  "vpc-router:eth1"]
+    - endpoints: ["instance-b:eth1",  "vpc-router:eth1"]
+    - endpoints: ["client:eth1",      "vpc-router:eth1"]
+    - endpoints: ["instance-a:eth2",  "vpc-router:eth2"]
+
+# -------------------------------------------------------------
+# EXERCISES — ENI / Floating IP Simulation
+# -------------------------------------------------------------
+#
+# --- FLOATING IP (Elastic IP) SIMULATION ---
+# 1. "Elastic IP" 172.16.1.50 starts on instance-a:
+#      docker exec clab-lab3-3-eni-instance-a ip addr add 172.16.1.50/32 dev eth1
+#
+# 2. Verify client can reach it:
+#      docker exec clab-lab3-3-eni-client ping 172.16.1.50
+#
+# 3. "Move" the Elastic IP to instance-b (simulates ENI reassociation):
+#      docker exec clab-lab3-3-eni-instance-a ip addr del 172.16.1.50/32 dev eth1
+#      docker exec clab-lab3-3-eni-instance-b ip addr add 172.16.1.50/32 dev eth1
+#
+# 4. Client can immediately reach the new instance (no DNS TTL!):
+#      docker exec clab-lab3-3-eni-client ping 172.16.1.50
+#
+# --- MULTI-HOMED INSTANCE ---
+# 5. instance-a has interfaces in both subnets — view them:
+#      docker exec clab-lab3-3-eni-instance-a ip addr show
+#
+# 6. Test connectivity to both subnet gateways:
+#      docker exec clab-lab3-3-eni-instance-a ping 172.16.1.254   # via eth1
+#      docker exec clab-lab3-3-eni-instance-a ping 172.16.2.254   # via eth2
+#
+# --- SECONDARY IPs (like AWS secondary private IPs) ---
+# 7. All three IPs on eth1 are reachable from client:
+#      docker exec clab-lab3-3-eni-client ping 172.16.1.10
+#      docker exec clab-lab3-3-eni-client ping 172.16.1.11
+#      docker exec clab-lab3-3-eni-client ping 172.16.1.12
+#
+# --- INTERFACE HOT-PLUG / ip netns (simulates ENI attach/detach) ---
+# In AWS, ENIs are attached/detached to running instances without stopping them.
+# Linux network namespaces are the underlying primitive that makes this work.
+# Each container IS a network namespace — we can move interfaces between them.
+#
+# 8. Find the network namespace (netns) for each container:
+#      # On the VM host (not inside a container):
+#      sudo ls /var/run/netns/
+#      # Or via docker inspect:
+#      docker inspect clab-lab3-3-eni-instance-a --format '{{.NetworkSettings.SandboxID}}' | cut -c1-12
+#
+# 9. View interfaces inside a container's netns using nsenter:
+#      # Get the PID of the container:
+#      PID=$(docker inspect -f '{{.State.Pid}}' clab-lab3-3-eni-instance-a)
+#      echo "Container PID: $PID"
+#      # Enter the network namespace and list interfaces:
+#      sudo nsenter -t $PID -n ip addr show
+#
+# 10. PRESERVED MAC ADDRESS FAILOVER:
+#     In AWS, when you move an ENI, the MAC address moves with it.
+#     Applications that license by MAC (or use MAC for DHCP) work across failover.
+#     Simulate this with a veth pair:
+#
+#      # Create a veth pair on the VM host:
+#      sudo ip link add veth-test type veth peer name veth-peer
+#      sudo ip link set veth-test up
+#
+#      # Move veth-test INTO instance-a's namespace:
+#      PID_A=$(docker inspect -f '{{.State.Pid}}' clab-lab3-3-eni-instance-a)
+#      sudo ip link set veth-test netns $PID_A
+#
+#      # Configure it inside instance-a:
+#      docker exec clab-lab3-3-eni-instance-a ip link set veth-test up
+#      docker exec clab-lab3-3-eni-instance-a ip addr add 172.16.1.200/32 dev veth-test
+#
+#      # Note the MAC address:
+#      docker exec clab-lab3-3-eni-instance-a ip link show veth-test
+#
+#      # "Detach" — move veth-test OUT of instance-a back to host:
+#      PID_A=$(docker inspect -f '{{.State.Pid}}' clab-lab3-3-eni-instance-a)
+#      sudo nsenter -t $PID_A -n ip link set veth-test netns 1
+#
+#      # "Re-attach" — move into instance-b (MAC is preserved!):
+#      PID_B=$(docker inspect -f '{{.State.Pid}}' clab-lab3-3-eni-instance-b)
+#      sudo ip link set veth-test netns $PID_B
+#      docker exec clab-lab3-3-eni-instance-b ip link set veth-test up
+#      docker exec clab-lab3-3-eni-instance-b ip addr add 172.16.1.200/32 dev veth-test
+#
+#      # Confirm MAC is identical on instance-b:
+#      docker exec clab-lab3-3-eni-instance-b ip link show veth-test
+#      # KEY: same MAC, same IP, now on a different "instance"

@@ -1,0 +1,200 @@
+# Lab 6.4 — Advanced ENI Patterns
+#
+# Complex multi-interface scenarios:
+#   - Active/passive network appliance cluster with ENI failover
+#   - Multi-tier application with per-ENI security group simulation
+#   - Shared ENI pattern (simulates AWS Lambda VPC networking)
+#   - ENI trunking (multiple VLANs on single ENI)
+#   - Elastic Fabric Adapter concepts (low-latency bypass)
+#
+# Deploy: sudo containerlab deploy -t lab6.4-advanced-eni.clab.yml
+
+name: lab6-4-adv-eni
+
+topology:
+  nodes:
+    # ── VPC Router ────────────────────────────────────────────
+    vpc-router:
+      kind: linux
+      image: frrouting/frr:latest
+      exec:
+        - sysctl -w net.ipv4.ip_forward=1
+        - ip link set eth1 up   # mgmt subnet
+        - ip link set eth2 up   # app subnet
+        - ip link set eth3 up   # data subnet
+        - ip link set eth4 up   # HA subnet (appliances)
+        - ip addr add 10.0.0.254/24  dev eth1
+        - ip addr add 10.0.1.254/24  dev eth2
+        - ip addr add 10.0.2.254/24  dev eth3
+        - ip addr add 10.0.3.254/24  dev eth4
+
+    # ── SCENARIO A: Network Appliance Cluster (active/passive) ─
+    # appliance-1 is ACTIVE — holds the floating "service IP" 10.0.3.100
+    # appliance-2 is STANDBY — ready to take over
+    appliance-active:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip link set eth1 up
+        - ip link set eth2 up
+        - ip addr add 10.0.3.10/24 dev eth1   # HA subnet (primary ENI)
+        - ip addr add 10.0.0.10/24 dev eth2   # mgmt ENI
+        - ip route add default via 10.0.3.254
+        # Floating "service IP" — this is what clients send traffic to
+        - ip addr add 10.0.3.100/32 dev eth1
+        - sysctl -w net.ipv4.ip_forward=1
+        # Simulate deep-packet inspection / NAT appliance
+        - iptables -t nat -A POSTROUTING -o eth1 -j MASQUERADE
+
+    appliance-standby:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip link set eth1 up
+        - ip link set eth2 up
+        - ip addr add 10.0.3.20/24 dev eth1
+        - ip addr add 10.0.0.20/24 dev eth2
+        - ip route add default via 10.0.3.254
+        # NOTE: 10.0.3.100 is NOT assigned here — standby waits for failover
+
+    # ── SCENARIO B: Multi-tier app with per-ENI isolation ──────
+    # app-server has 3 ENIs: web-facing, app-tier, db-tier
+    # Each ENI is in a different subnet = different security zone
+    app-server:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip link set eth1 up   # web ENI — public-facing subnet
+        - ip link set eth2 up   # app ENI — internal app subnet
+        - ip link set eth3 up   # db ENI  — database subnet
+        - ip addr add 10.0.0.30/24 dev eth1
+        - ip addr add 10.0.1.30/24 dev eth2
+        - ip addr add 10.0.2.30/24 dev eth3
+        - ip route add default via 10.0.0.254
+        # Per-ENI "security group" rules (iptables per interface)
+        # eth1: allow 80/443 inbound only (web tier)
+        - iptables -A INPUT  -i eth1 -p tcp --dport 80  -j ACCEPT
+        - iptables -A INPUT  -i eth1 -p tcp --dport 443 -j ACCEPT
+        - iptables -A INPUT  -i eth1 -p tcp -j DROP
+        # eth3: allow only MySQL from app-subnet (db tier)
+        - iptables -A INPUT  -i eth3 -s 10.0.1.0/24 -p tcp --dport 3306 -j ACCEPT
+        - iptables -A INPUT  -i eth3 -p tcp --dport 3306 -j DROP
+
+    # ── SCENARIO C: Shared ENI (Lambda-style) ──────────────────
+    # Multiple "Lambda functions" share the same ENI IP range.
+    # Each function gets a /32 from the subnet — the ENI is pre-warmed.
+    lambda-eni-host:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip link set eth1 up
+        # Pre-allocate /32 IPs simulating Lambda function ENIs
+        - ip addr add 10.0.1.50/24 dev eth1   # primary ENI IP
+        - ip addr add 10.0.1.51/32 dev eth1   # lambda-fn-1
+        - ip addr add 10.0.1.52/32 dev eth1   # lambda-fn-2
+        - ip addr add 10.0.1.53/32 dev eth1   # lambda-fn-3
+        - ip addr add 10.0.1.54/32 dev eth1   # lambda-fn-4
+        - ip route add default via 10.0.1.254
+
+    # ── SCENARIO D: ENI trunking (multiple VLANs on one ENI) ───
+    # Simulates trunk mode ENIs used by ECS/Kubernetes node networking.
+    # Each pod/container gets its own VLAN-tagged subinterface.
+    eni-trunk-host:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip link set eth1 up
+        - ip addr add 10.0.1.60/24 dev eth1   # host primary IP
+        # Pod ENIs via VLAN subinterfaces (each pod gets isolated VLAN)
+        - ip link add link eth1 name eth1.101 type vlan id 101
+        - ip link add link eth1 name eth1.102 type vlan id 102
+        - ip link add link eth1 name eth1.103 type vlan id 103
+        - ip link set eth1.101 up
+        - ip link set eth1.102 up
+        - ip link set eth1.103 up
+        - ip addr add 10.0.1.61/32 dev eth1.101   # pod-1
+        - ip addr add 10.0.1.62/32 dev eth1.102   # pod-2
+        - ip addr add 10.0.1.63/32 dev eth1.103   # pod-3
+        - ip route add default via 10.0.1.254
+
+    # Client to test all scenarios from
+    client:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip link set eth1 up
+        - ip addr add 10.0.0.50/24 dev eth1
+        - ip route add default via 10.0.0.254
+        - ip route add 10.0.1.0/24 via 10.0.0.254
+        - ip route add 10.0.2.0/24 via 10.0.0.254
+        - ip route add 10.0.3.0/24 via 10.0.0.254
+
+  links:
+    - endpoints: ["appliance-active:eth1",  "vpc-router:eth4"]
+    - endpoints: ["appliance-standby:eth1", "vpc-router:eth4"]
+    - endpoints: ["appliance-active:eth2",  "vpc-router:eth1"]
+    - endpoints: ["appliance-standby:eth2", "vpc-router:eth1"]
+    - endpoints: ["app-server:eth1",        "vpc-router:eth1"]
+    - endpoints: ["app-server:eth2",        "vpc-router:eth2"]
+    - endpoints: ["app-server:eth3",        "vpc-router:eth3"]
+    - endpoints: ["lambda-eni-host:eth1",   "vpc-router:eth2"]
+    - endpoints: ["eni-trunk-host:eth1",    "vpc-router:eth2"]
+    - endpoints: ["client:eth1",            "vpc-router:eth1"]
+
+# -------------------------------------------------------------
+# EXERCISES
+# -------------------------------------------------------------
+#
+# SCENARIO A — Network appliance failover
+# 1. Client sends traffic through the active appliance (service IP 10.0.3.100):
+#      docker exec clab-lab6-4-adv-eni-client ping -c3 10.0.3.100
+#
+# 2. Simulate appliance failure — remove floating IP (ENI disassociation):
+#      docker exec clab-lab6-4-adv-eni-appliance-active \
+#        ip addr del 10.0.3.100/32 dev eth1
+#
+# 3. Promote standby — assign floating IP (ENI association to standby):
+#      docker exec clab-lab6-4-adv-eni-appliance-standby \
+#        ip addr add 10.0.3.100/32 dev eth1
+#
+# 4. Client traffic resumes without any config change on client:
+#      docker exec clab-lab6-4-adv-eni-client ping -c3 10.0.3.100
+#
+#
+# SCENARIO B — Per-ENI security group enforcement
+# 5. HTTP (port 80) allowed on web ENI:
+#      docker exec clab-lab6-4-adv-eni-client nc -zv 10.0.0.30 80
+#
+# 6. SSH (port 22) blocked on web ENI (wrong security group):
+#      docker exec clab-lab6-4-adv-eni-client nc -zv 10.0.0.30 22
+#
+# 7. MySQL (3306) allowed only from app-subnet, blocked from elsewhere:
+#      # This should fail (client is in mgmt subnet, not app subnet):
+#      docker exec clab-lab6-4-adv-eni-client nc -zv 10.0.2.30 3306
+#
+#
+# SCENARIO C — Lambda-style shared ENI
+# 8. All four "function IPs" are reachable from client:
+#      for ip in 51 52 53 54; do
+#        docker exec clab-lab6-4-adv-eni-client ping -c1 10.0.1.$ip
+#      done
+#
+# 9. "Scale down" — deallocation of a Lambda IP:
+#      docker exec clab-lab6-4-adv-eni-lambda-eni-host \
+#        ip addr del 10.0.1.54/32 dev eth1
+#      docker exec clab-lab6-4-adv-eni-client ping -c1 10.0.1.54  # unreachable
+#
+#
+# SCENARIO D — ENI trunking / pod networking
+# 10. Each pod IP on its own VLAN subinterface is reachable:
+#       docker exec clab-lab6-4-adv-eni-client ping -c1 10.0.1.61
+#       docker exec clab-lab6-4-adv-eni-client ping -c1 10.0.1.62
+#       docker exec clab-lab6-4-adv-eni-client ping -c1 10.0.1.63
+#
+# 11. View the VLAN subinterfaces simulating pod ENIs:
+#       docker exec clab-lab6-4-adv-eni-eni-trunk-host ip addr show
+#
+# 12. KEY INSIGHT: This is exactly how EKS worker nodes work.
+#     Each pod gets a /32 IP from the node's subnet, delivered via
+#     a VLAN-tagged ENI in "trunk mode". The VPC CNI plugin manages
+#     this dynamically as pods are scheduled and terminated.

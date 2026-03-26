@@ -1,0 +1,105 @@
+# Lab 2.2 — VLAN Trunking (802.1Q)
+# Two switches connected by a trunk. VLANs 10 and 20 span both switches.
+# Deploy: sudo containerlab deploy -t lab2.2-trunking.clab.yml
+
+name: lab2-2-trunking
+
+topology:
+  nodes:
+    sw1:
+      kind: linux
+      image: frrouting/frr:latest
+      exec:
+        - ip link add name br0 type bridge vlan_filtering 1
+        - ip link set br0 up
+        - ip link set eth1 master br0
+        - ip link set eth2 master br0
+        - ip link set eth3 master br0
+        # Access port: eth1 → VLAN 10
+        - bridge vlan add vid 10 dev eth1 pvid untagged
+        - bridge vlan del vid 1  dev eth1
+        # Access port: eth2 → VLAN 20
+        - bridge vlan add vid 20 dev eth2 pvid untagged
+        - bridge vlan del vid 1  dev eth2
+        # Trunk port: eth3 carries VLANs 10 and 20 (tagged)
+        - bridge vlan add vid 10 dev eth3
+        - bridge vlan add vid 20 dev eth3
+        - bridge vlan del vid 1  dev eth3
+
+    sw2:
+      kind: linux
+      image: frrouting/frr:latest
+      exec:
+        - ip link add name br0 type bridge vlan_filtering 1
+        - ip link set br0 up
+        - ip link set eth1 master br0
+        - ip link set eth2 master br0
+        - ip link set eth3 master br0
+        # Access port: eth1 → VLAN 10
+        - bridge vlan add vid 10 dev eth1 pvid untagged
+        - bridge vlan del vid 1  dev eth1
+        # Access port: eth2 → VLAN 20
+        - bridge vlan add vid 20 dev eth2 pvid untagged
+        - bridge vlan del vid 1  dev eth2
+        # Trunk port: eth3 carries VLANs 10 and 20 (tagged)
+        - bridge vlan add vid 10 dev eth3
+        - bridge vlan add vid 20 dev eth3
+        - bridge vlan del vid 1  dev eth3
+
+    # Hosts on sw1
+    host-sw1-v10:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip addr add 10.10.0.11/24 dev eth1
+        - ip link set eth1 up
+
+    host-sw1-v20:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip addr add 10.20.0.11/24 dev eth1
+        - ip link set eth1 up
+
+    # Hosts on sw2
+    host-sw2-v10:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip addr add 10.10.0.22/24 dev eth1
+        - ip link set eth1 up
+
+    host-sw2-v20:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip addr add 10.20.0.22/24 dev eth1
+        - ip link set eth1 up
+
+  links:
+    - endpoints: ["host-sw1-v10:eth1", "sw1:eth1"]
+    - endpoints: ["host-sw1-v20:eth1", "sw1:eth2"]
+    - endpoints: ["host-sw2-v10:eth1", "sw2:eth1"]
+    - endpoints: ["host-sw2-v20:eth1", "sw2:eth2"]
+    # Trunk link between switches
+    - endpoints: ["sw1:eth3", "sw2:eth3"]
+
+# -------------------------------------------------------------
+# EXERCISES
+# -------------------------------------------------------------
+# 1. VLAN 10 crosses the trunk (should succeed):
+#      docker exec clab-lab2-2-trunking-host-sw1-v10 ping 10.10.0.22
+#
+# 2. VLAN 20 crosses the trunk (should succeed):
+#      docker exec clab-lab2-2-trunking-host-sw1-v20 ping 10.20.0.22
+#
+# 3. Cross-VLAN is still blocked (should fail):
+#      docker exec clab-lab2-2-trunking-host-sw1-v10 ping 10.20.0.11
+#
+# 4. Capture 802.1Q tagged frames on the trunk link:
+#      docker exec -it clab-lab2-2-trunking-sw1 \
+#        tcpdump -i eth3 -n -e vlan
+#    Look for "vlan 10" and "vlan 20" tags in the output.
+#
+# 5. View trunk VLAN membership:
+#      docker exec -it clab-lab2-2-trunking-sw1 bridge vlan show dev eth3

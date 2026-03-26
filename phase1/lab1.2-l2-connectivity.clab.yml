@@ -1,0 +1,58 @@
+# Lab 1.2 — Layer 2 Connectivity
+# 3 hosts on a Linux bridge. Explore MACs, ARP, tcpdump.
+# Deploy: sudo containerlab deploy -t lab1.2-l2-connectivity.clab.yml
+
+name: lab1-2-l2-connectivity
+
+topology:
+  nodes:
+    sw1:
+      kind: bridge
+
+    host1:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip addr add 10.0.0.1/24 dev eth1
+        - ip link set eth1 up
+
+    host2:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip addr add 10.0.0.2/24 dev eth1
+        - ip link set eth1 up
+
+    host3:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip addr add 10.0.0.3/24 dev eth1
+        - ip link set eth1 up
+
+  links:
+    - endpoints: ["host1:eth1", "sw1:eth1"]
+    - endpoints: ["host2:eth1", "sw1:eth2"]
+    - endpoints: ["host3:eth1", "sw1:eth3"]
+
+# -------------------------------------------------------------
+# EXERCISES
+# -------------------------------------------------------------
+# 1. Ping host2 and host3 from host1:
+#      docker exec -it clab-lab1-2-l2-connectivity-host1 bash
+#      ping 10.0.0.2 && ping 10.0.0.3
+#
+# 2. Observe ARP table build-up:
+#      arp -n
+#      ip neigh show
+#
+# 3. View MAC table on the Linux bridge (run on the VM host):
+#      bridge fdb show dev br-lab1-2-l2-connectivity
+#      (Note: bridge name matches topology name)
+#
+# 4. Capture ARP broadcast from host2 while host1 pings host3:
+#      docker exec -it clab-lab1-2-l2-connectivity-host2 bash
+#      tcpdump -i eth1 -n arp
+#
+# 5. Key observation: ARP requests are BROADCAST — all hosts see them.
+#    ARP replies are UNICAST — only the requester sees them.

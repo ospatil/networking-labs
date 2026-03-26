@@ -1,0 +1,63 @@
+# Lab 4.1 — Basic BGP Peering (eBGP)
+# Two FRR routers in different ASNs exchange prefixes over eBGP.
+# Deploy: sudo containerlab deploy -t lab4.1-bgp-basic.clab.yml
+
+name: lab4-1-bgp-basic
+
+topology:
+  nodes:
+    # Router in AS 65001 — "On-premises network"
+    router-a:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - router-a-frr.conf:/etc/frr/frr.conf
+        - daemons:/etc/frr/daemons
+      exec:
+        - ip addr add 10.0.0.1/30 dev eth1       # link to router-b
+        - ip addr add 192.168.1.0/24 dev lo        # simulated on-prem network
+        - ip link set eth1 up
+        - ip link set lo up
+
+    # Router in AS 65002 — "AWS side"
+    router-b:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - router-b-frr.conf:/etc/frr/frr.conf
+        - daemons:/etc/frr/daemons
+      exec:
+        - ip addr add 10.0.0.2/30 dev eth1       # link to router-a
+        - ip addr add 172.16.0.0/24 dev lo        # simulated VPC network
+        - ip link set eth1 up
+        - ip link set lo up
+
+  links:
+    - endpoints: ["router-a:eth1", "router-b:eth1"]
+
+# -------------------------------------------------------------
+# CONFIG FILES (create these alongside the .clab.yml)
+# See router-a-frr.conf and router-b-frr.conf below.
+# -------------------------------------------------------------
+#
+# EXERCISES
+# -------------------------------------------------------------
+# 1. Check BGP neighbor status on router-a:
+#      docker exec -it clab-lab4-1-bgp-basic-router-a vtysh -c "show bgp summary"
+#
+# 2. View BGP table (learned prefixes):
+#      docker exec -it clab-lab4-1-bgp-basic-router-a vtysh -c "show bgp ipv4 unicast"
+#
+# 3. View IP routing table — BGP routes marked with 'B':
+#      docker exec -it clab-lab4-1-bgp-basic-router-a vtysh -c "show ip route"
+#
+# 4. Verify end-to-end reachability across ASes:
+#      docker exec clab-lab4-1-bgp-basic-router-a ping 172.16.0.0
+#
+# 5. Check neighbor details (AS path, capabilities):
+#      docker exec -it clab-lab4-1-bgp-basic-router-a \
+#        vtysh -c "show bgp neighbors 10.0.0.2"
+#
+# 6. Watch BGP updates in real time:
+#      docker exec -it clab-lab4-1-bgp-basic-router-a \
+#        vtysh -c "debug bgp updates"

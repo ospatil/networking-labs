@@ -1,0 +1,57 @@
+# Lab 1.1 — Environment Setup & First Topology
+# Two hosts connected via a Linux bridge (simulates a simple switch)
+# Deploy: sudo containerlab deploy -t lab1.1-first-topology.clab.yml
+# Destroy: sudo containerlab destroy -t lab1.1-first-topology.clab.yml
+
+name: lab1-1-first-topology
+
+topology:
+  nodes:
+    # Linux bridge acting as a simple switch
+    bridge1:
+      kind: bridge
+
+    # Two end hosts using a lightweight network multitool image
+    host1:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip addr add 192.168.1.1/24 dev eth1
+        - ip link set eth1 up
+
+    host2:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip addr add 192.168.1.2/24 dev eth1
+        - ip link set eth1 up
+
+  links:
+    - endpoints: ["host1:eth1", "bridge1:eth1"]
+    - endpoints: ["host2:eth1", "bridge1:eth2"]
+
+# -------------------------------------------------------------
+# EXERCISES
+# -------------------------------------------------------------
+# 1. Deploy the lab:
+#      sudo containerlab deploy -t lab1.1-first-topology.clab.yml
+#
+# 2. List running nodes:
+#      sudo containerlab inspect -t lab1.1-first-topology.clab.yml
+#
+# 3. Shell into host1:
+#      sudo docker exec -it clab-lab1-1-first-topology-host1 bash
+#
+# 4. Ping host2 from host1:
+#      ping 192.168.1.2
+#
+# 5. On host1, watch ARP populate:
+#      arp -n
+#
+# 6. Capture traffic on the bridge from host2:
+#      sudo docker exec -it clab-lab1-1-first-topology-host2 bash
+#      tcpdump -i eth1 -n
+#      (while pinging from host1 in another terminal)
+#
+# 7. Destroy the lab when done:
+#      sudo containerlab destroy -t lab1.1-first-topology.clab.yml

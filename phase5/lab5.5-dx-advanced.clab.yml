@@ -1,0 +1,128 @@
+# Lab 5.5 — Advanced DX: Redundancy, BFD, Traffic Engineering
+#
+# Two DX connections (active/passive failover with AS-PATH prepending)
+#
+#  [on-prem-router] ──DX-primary──> [aws-edge-1] ──> [vpc-gateway]
+#        |                                                  ^
+#        └──────DX-backup──> [aws-edge-2] ─────────────────┘
+#
+# Primary path: AS-PATH = 65001 (normal)
+# Backup path:  AS-PATH = 65001 65001 65001 (prepended — less preferred)
+#
+# Deploy: sudo containerlab deploy -t lab5.5-dx-advanced.clab.yml
+
+name: lab5-5-dx-advanced
+
+topology:
+  nodes:
+    on-prem-router:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - advanced-configs/on-prem-dual.conf:/etc/frr/frr.conf
+        - configs/daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up   # primary DX
+        - ip link set eth2 up   # backup DX
+        - ip link add link eth1 name eth1.100 type vlan id 100
+        - ip link add link eth2 name eth2.200 type vlan id 200
+        - ip link set eth1.100 up
+        - ip link set eth2.200 up
+        - ip addr add 169.254.100.1/30 dev eth1.100  # primary BGP peer
+        - ip addr add 169.254.200.1/30 dev eth2.200  # backup BGP peer
+        - ip addr add 10.100.0.0/22 dev lo            # on-prem aggregate
+        - ip link set lo up
+        - sysctl -w net.ipv4.ip_forward=1
+
+    aws-edge-1:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - advanced-configs/aws-edge-1.conf:/etc/frr/frr.conf
+        - configs/daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up
+        - ip link set eth2 up
+        - ip link add link eth1 name eth1.100 type vlan id 100
+        - ip link set eth1.100 up
+        - ip addr add 169.254.100.2/30 dev eth1.100
+        - ip addr add 10.200.0.1/30 dev eth2
+        - sysctl -w net.ipv4.ip_forward=1
+
+    aws-edge-2:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - advanced-configs/aws-edge-2.conf:/etc/frr/frr.conf
+        - configs/daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up
+        - ip link set eth2 up
+        - ip link add link eth1 name eth1.200 type vlan id 200
+        - ip link set eth1.200 up
+        - ip addr add 169.254.200.2/30 dev eth1.200
+        - ip addr add 10.200.0.5/30 dev eth2
+        - sysctl -w net.ipv4.ip_forward=1
+
+    vpc-gateway:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - advanced-configs/vpc-gw-dual.conf:/etc/frr/frr.conf
+        - configs/daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up
+        - ip link set eth2 up
+        - ip link set eth3 up
+        - ip addr add 10.200.0.2/30 dev eth1   # link to aws-edge-1
+        - ip addr add 10.200.0.6/30 dev eth2   # link to aws-edge-2
+        - ip addr add 10.0.0.254/24 dev eth3   # VPC subnet
+        - sysctl -w net.ipv4.ip_forward=1
+
+    ec2-instance:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip link set eth1 up
+        - ip addr add 10.0.0.10/24 dev eth1
+        - ip route add default via 10.0.0.254
+
+  links:
+    - endpoints: ["on-prem-router:eth1",  "aws-edge-1:eth1"]   # primary DX
+    - endpoints: ["on-prem-router:eth2",  "aws-edge-2:eth1"]   # backup DX
+    - endpoints: ["aws-edge-1:eth2",      "vpc-gateway:eth1"]
+    - endpoints: ["aws-edge-2:eth2",      "vpc-gateway:eth2"]
+    - endpoints: ["vpc-gateway:eth3",     "ec2-instance:eth1"]
+
+# -------------------------------------------------------------
+# EXERCISES — Traffic Engineering & Failover
+# -------------------------------------------------------------
+#
+# 1. Verify both BGP sessions are up:
+#      docker exec -it clab-lab5-5-dx-advanced-on-prem-router \
+#        vtysh -c "show bgp summary"
+#    You should see two neighbors: 169.254.100.2 and 169.254.200.2
+#
+# 2. Check which path AWS is using to reach on-prem (should prefer primary):
+#      docker exec -it clab-lab5-5-dx-advanced-vpc-gateway \
+#        vtysh -c "show bgp ipv4 unicast 10.100.0.0/22"
+#    Primary path has shorter AS-PATH = preferred.
+#
+# 3. Simulate primary DX failure — stop aws-edge-1:
+#      docker stop clab-lab5-5-dx-advanced-aws-edge-1
+#
+# 4. Watch BGP reconverge (wait ~30 seconds for hold-timer):
+#      docker exec -it clab-lab5-5-dx-advanced-on-prem-router \
+#        vtysh -c "show bgp summary"
+#
+# 5. Verify traffic now flows via backup path:
+#      docker exec clab-lab5-5-dx-advanced-on-prem-router ping 10.0.0.10
+#      docker exec clab-lab5-5-dx-advanced-on-prem-router traceroute 10.0.0.10
+#
+# 6. Restore primary and observe failback:
+#      docker start clab-lab5-5-dx-advanced-aws-edge-1
+#
+# 7. BFD reduces failover time from ~90s to <1s.
+#    Add to both routers' BGP neighbor config:
+#      neighbor 169.254.100.2 bfd
+#    Then re-test failover speed.

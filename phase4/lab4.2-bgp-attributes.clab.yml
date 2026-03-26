@@ -1,0 +1,138 @@
+# Lab 4.2 — BGP Attributes & Path Selection
+#
+# Topology: triangle of 3 routers in 3 different ASes.
+# AS65003 has TWO paths to reach AS65001's prefix (192.168.1.0/24):
+#   Path A: 65003 → 65002 → 65001  (via router-b, 2 hops)
+#   Path B: 65003 → 65001          (direct, 1 hop)
+#
+# We'll manipulate LOCAL_PREF, MED, and AS-PATH prepending to
+# observe how BGP chooses between paths.
+#
+#   router-a (AS65001) ←──eBGP──→ router-b (AS65002)
+#        ↑                               ↑
+#        └──────────eBGP────────── router-c (AS65003)
+#
+# Deploy: sudo containerlab deploy -t lab4.2-bgp-attributes.clab.yml
+
+name: lab4-2-bgp-attributes
+
+topology:
+  nodes:
+    router-a:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - router-a.conf:/etc/frr/frr.conf
+        - daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up   # link to router-b
+        - ip link set eth2 up   # link to router-c
+        - ip addr add 10.0.12.1/30 dev eth1
+        - ip addr add 10.0.13.1/30 dev eth2
+        - ip addr add 192.168.1.0/24 dev lo
+        - ip link set lo up
+        - sysctl -w net.ipv4.ip_forward=1
+
+    router-b:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - router-b.conf:/etc/frr/frr.conf
+        - daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up   # link to router-a
+        - ip link set eth2 up   # link to router-c
+        - ip addr add 10.0.12.2/30 dev eth1
+        - ip addr add 10.0.23.1/30 dev eth2
+        - sysctl -w net.ipv4.ip_forward=1
+
+    router-c:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - router-c.conf:/etc/frr/frr.conf
+        - daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up   # link to router-a (direct path)
+        - ip link set eth2 up   # link to router-b
+        - ip addr add 10.0.13.2/30 dev eth1
+        - ip addr add 10.0.23.2/30 dev eth2
+        - ip addr add 172.16.3.0/24 dev lo
+        - ip link set lo up
+        - sysctl -w net.ipv4.ip_forward=1
+
+  links:
+    - endpoints: ["router-a:eth1", "router-b:eth1"]   # A ↔ B
+    - endpoints: ["router-a:eth2", "router-c:eth1"]   # A ↔ C (direct)
+    - endpoints: ["router-b:eth2", "router-c:eth2"]   # B ↔ C
+
+# -------------------------------------------------------------
+# EXERCISES
+# -------------------------------------------------------------
+# 1. Deploy and verify all 3 BGP sessions are up:
+#      docker exec -it clab-lab4-2-bgp-attributes-router-c \
+#        vtysh -c "show bgp summary"
+#    Expect: neighbors 10.0.13.1 (router-a) AND 10.0.23.1 (router-b) = Established
+#
+# 2. View BGP table on router-c — should see TWO paths to 192.168.1.0/24:
+#      docker exec -it clab-lab4-2-bgp-attributes-router-c \
+#        vtysh -c "show bgp ipv4 unicast 192.168.1.0/24"
+#    The '>' marks the best (selected) path. Which one wins and why?
+#    (Hint: shorter AS-PATH wins by default — direct path via 10.0.13.1)
+#
+# EXPERIMENT A — AS-PATH Prepending (make direct path less preferred)
+# 3. On router-a, prepend AS-PATH when advertising to router-c:
+#      docker exec -it clab-lab4-2-bgp-attributes-router-a vtysh
+#      conf t
+#      route-map PREPEND-TO-C permit 10
+#       set as-path prepend 65001 65001 65001
+#      router bgp 65001
+#       address-family ipv4 unicast
+#        neighbor 10.0.13.2 route-map PREPEND-TO-C out
+#      end
+#      clear bgp ipv4 unicast 10.0.13.2 soft out
+#
+# 4. Re-check best path on router-c — should now prefer path via router-b:
+#      docker exec -it clab-lab4-2-bgp-attributes-router-c \
+#        vtysh -c "show bgp ipv4 unicast 192.168.1.0/24"
+#
+# EXPERIMENT B — LOCAL_PREF (prefer one path regardless of AS-PATH)
+# 5. On router-c, set LOCAL_PREF=200 for routes from router-a (direct path):
+#    (LOCAL_PREF is evaluated BEFORE AS-PATH — higher wins)
+#      docker exec -it clab-lab4-2-bgp-attributes-router-c vtysh
+#      conf t
+#      route-map PREFER-DIRECT permit 10
+#       set local-preference 200
+#      router bgp 65003
+#       address-family ipv4 unicast
+#        neighbor 10.0.13.1 route-map PREFER-DIRECT in
+#      end
+#      clear bgp ipv4 unicast * soft in
+#
+# 6. Direct path wins again despite longer AS-PATH:
+#      docker exec -it clab-lab4-2-bgp-attributes-router-c \
+#        vtysh -c "show bgp ipv4 unicast 192.168.1.0/24"
+#
+# EXPERIMENT C — BGP Communities
+# 7. Tag routes from router-a with community 65001:100:
+#      docker exec -it clab-lab4-2-bgp-attributes-router-a vtysh
+#      conf t
+#      route-map TAG-ROUTES permit 10
+#       set community 65001:100
+#      router bgp 65001
+#       address-family ipv4 unicast
+#        neighbor 10.0.12.2 route-map TAG-ROUTES out
+#      end
+#
+# 8. On router-b, filter routes based on community:
+#      docker exec -it clab-lab4-2-bgp-attributes-router-b vtysh
+#      conf t
+#      ip community-list standard MY-COMMUNITY permit 65001:100
+#      route-map FILTER-BY-COMMUNITY permit 10
+#       match community MY-COMMUNITY
+#      route-map FILTER-BY-COMMUNITY deny 20
+#      router bgp 65002
+#       address-family ipv4 unicast
+#        neighbor 10.0.23.1 route-map FILTER-BY-COMMUNITY out
+#      end
+#    Result: router-c loses the path via router-b entirely!

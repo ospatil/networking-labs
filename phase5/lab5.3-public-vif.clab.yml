@@ -1,0 +1,167 @@
+# Lab 5.3 — Public Virtual Interface (Public VIF)
+#
+# Builds on lab 5.2 by adding a SECOND VIF on the same trunk.
+# VLAN 100 = Private VIF  (on-prem <-> VPC private IPs)   ← from lab 5.2
+# VLAN 200 = Public VIF   (on-prem <-> AWS public service IPs)  ← NEW
+#
+# Real-world use: Public VIF lets on-prem reach AWS public endpoints
+# (S3, DynamoDB, SQS, etc.) without going over the internet.
+# Traffic stays on your DX connection but uses public IP space.
+#
+# Key differences vs Private VIF:
+#   - Uses publicly routable IPs on both sides (not RFC1918)
+#   - Customer must own/advertise a public prefix (or use a /31 AWS provides)
+#   - AWS advertises its public service prefixes (huge list: ~5000+ prefixes)
+#   - Strict prefix filtering required (no default route, no bogons)
+#
+# Topology (same physical path as 5.2, second VIF added):
+#
+#  [on-prem-router] == VLAN100 (private) + VLAN200 (public) ==> [aws-edge] --> [vgw] --> VPC
+#                                                                     |
+#                                                               [aws-public-svc]
+#                                                          (simulates S3/SQS endpoints)
+#
+# Deploy: sudo containerlab deploy -t lab5.3-public-vif.clab.yml
+
+name: lab5-3-public-vif
+
+topology:
+  nodes:
+    on-prem-router:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - pub-configs/on-prem-pub.conf:/etc/frr/frr.conf
+        - configs/daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up
+        # Private VIF — VLAN 100
+        - ip link add link eth1 name eth1.100 type vlan id 100
+        - ip link set eth1.100 up
+        - ip addr add 169.254.100.1/30 dev eth1.100
+        # Public VIF — VLAN 200
+        - ip link add link eth1 name eth1.200 type vlan id 200
+        - ip link set eth1.200 up
+        - ip addr add 169.254.200.1/30 dev eth1.200
+        # Simulated on-prem private network
+        - ip addr add 10.100.0.0/24 dev lo
+        # Simulated customer-owned PUBLIC prefix (you must own this in real DX)
+        - ip addr add 203.0.113.0/24 dev lo
+        - ip link set lo up
+        - sysctl -w net.ipv4.ip_forward=1
+
+    aws-edge:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - pub-configs/aws-edge-pub.conf:/etc/frr/frr.conf
+        - configs/daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up
+        - ip link set eth2 up
+        - ip link set eth3 up
+        # Private VIF termination
+        - ip link add link eth1 name eth1.100 type vlan id 100
+        - ip link set eth1.100 up
+        - ip addr add 169.254.100.2/30 dev eth1.100
+        # Public VIF termination
+        - ip link add link eth1 name eth1.200 type vlan id 200
+        - ip link set eth1.200 up
+        - ip addr add 169.254.200.2/30 dev eth1.200
+        # Links to VGW and public services router
+        - ip addr add 10.200.0.1/30 dev eth2
+        - ip addr add 10.200.1.1/30 dev eth3
+        - sysctl -w net.ipv4.ip_forward=1
+
+    # Virtual Private Gateway (same as lab 5.2)
+    vgw:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - configs/vpc-gateway.conf:/etc/frr/frr.conf
+        - configs/daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up
+        - ip link set eth2 up
+        - ip addr add 10.200.0.2/30 dev eth1
+        - ip addr add 10.0.0.254/24 dev eth2
+        - sysctl -w net.ipv4.ip_forward=1
+
+    # Simulates AWS public service endpoints (S3, SQS, DynamoDB, etc.)
+    # In reality AWS advertises ~5000 prefixes on the public VIF.
+    # We simulate with a handful of representative "public" prefixes.
+    aws-public-svc:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - pub-configs/aws-public-svc.conf:/etc/frr/frr.conf
+        - configs/daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up
+        - ip addr add 10.200.1.2/30 dev eth1
+        # Simulated AWS public service IP blocks
+        # (real prefixes: 52.92.0.0/20 = S3, 52.94.0.0/22 = DynamoDB, etc.)
+        - ip addr add 52.92.0.1/20 dev lo    # simulated S3 prefix
+        - ip addr add 52.94.0.1/22 dev lo    # simulated DynamoDB prefix
+        - ip link set lo up
+        - sysctl -w net.ipv4.ip_forward=1
+        # Simulate an S3-like HTTP endpoint
+        - python3 -m http.server 443 &
+
+    ec2:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip link set eth1 up
+        - ip addr add 10.0.0.10/24 dev eth1
+        - ip route add default via 10.0.0.254
+
+  links:
+    - endpoints: ["on-prem-router:eth1",  "aws-edge:eth1"]    # DX trunk (VLANs 100+200)
+    - endpoints: ["aws-edge:eth2",        "vgw:eth1"]         # private path
+    - endpoints: ["aws-edge:eth3",        "aws-public-svc:eth1"] # public path
+    - endpoints: ["vgw:eth2",             "ec2:eth1"]
+
+# -------------------------------------------------------------
+# EXERCISES
+# -------------------------------------------------------------
+# 1. Verify BOTH BGP sessions are up (private + public VIF):
+#      docker exec -it clab-lab5-3-public-vif-on-prem-router \
+#        vtysh -c "show bgp summary"
+#    You should see TWO established neighbors:
+#      169.254.100.2  (private VIF)
+#      169.254.200.2  (public VIF)
+#
+# 2. Check what prefixes AWS is advertising on the PUBLIC VIF:
+#      docker exec -it clab-lab5-3-public-vif-on-prem-router \
+#        vtysh -c "show bgp ipv4 unicast neighbors 169.254.200.2 received-routes"
+#    Should see: 52.92.0.0/20 and 52.94.0.0/22
+#
+# 3. Check what on-prem is advertising on the PUBLIC VIF:
+#      docker exec -it clab-lab5-3-public-vif-aws-edge \
+#        vtysh -c "show bgp ipv4 unicast neighbors 169.254.200.1 received-routes"
+#    Should see: 203.0.113.0/24 (customer public prefix)
+#
+# 4. Reach AWS public services from on-prem (via DX, not internet):
+#      docker exec clab-lab5-3-public-vif-on-prem-router ping 52.92.0.1
+#
+# 5. Private VIF still works — reach EC2:
+#      docker exec clab-lab5-3-public-vif-on-prem-router ping 10.0.0.10
+#
+# 6. SECURITY EXERCISE — prefix filtering on public VIF:
+#    On-prem should NOT advertise RFC1918 or default route on public VIF.
+#    Add a prefix-list filter on the public VIF neighbor:
+#
+#      docker exec -it clab-lab5-3-public-vif-on-prem-router vtysh
+#      conf t
+#      ip prefix-list PUBLIC-OUT permit 203.0.113.0/24
+#      ip prefix-list PUBLIC-OUT deny any
+#      router bgp 65001
+#       address-family ipv4 unicast
+#        neighbor 169.254.200.2 prefix-list PUBLIC-OUT out
+#      end
+#      clear bgp 169.254.200.2 soft out
+#
+# 7. Verify: only 203.0.113.0/24 is sent, private prefixes are filtered:
+#      docker exec -it clab-lab5-3-public-vif-aws-edge \
+#        vtysh -c "show bgp ipv4 unicast neighbors 169.254.200.1 received-routes"

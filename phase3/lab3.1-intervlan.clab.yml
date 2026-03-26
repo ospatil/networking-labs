@@ -1,0 +1,85 @@
+# Lab 3.1 — Inter-VLAN Routing (Router on a Stick)
+# FRR router uses subinterfaces (eth1.10, eth1.20) to route between VLANs.
+# Deploy: sudo containerlab deploy -t lab3.1-intervlan.clab.yml
+
+name: lab3-1-intervlan
+
+topology:
+  nodes:
+    # L2 switch with trunk uplink to router
+    sw1:
+      kind: linux
+      image: frrouting/frr:latest
+      exec:
+        - ip link add name br0 type bridge vlan_filtering 1
+        - ip link set br0 up
+        # Access ports
+        - ip link set eth1 master br0
+        - ip link set eth2 master br0
+        - ip link set eth3 master br0
+        - bridge vlan add vid 10 dev eth1 pvid untagged
+        - bridge vlan del vid 1  dev eth1
+        - bridge vlan add vid 20 dev eth2 pvid untagged
+        - bridge vlan del vid 1  dev eth2
+        # Trunk uplink to router on eth3
+        - bridge vlan add vid 10 dev eth3
+        - bridge vlan add vid 20 dev eth3
+        - bridge vlan del vid 1  dev eth3
+
+    # FRR router with 802.1Q subinterfaces
+    router1:
+      kind: linux
+      image: frrouting/frr:latest
+      exec:
+        # Create VLAN subinterfaces on the trunk link
+        - ip link add link eth1 name eth1.10 type vlan id 10
+        - ip link add link eth1 name eth1.20 type vlan id 20
+        - ip link set eth1 up
+        - ip link set eth1.10 up
+        - ip link set eth1.20 up
+        # Assign gateway IPs (these become default gateways for each VLAN)
+        - ip addr add 10.10.0.254/24 dev eth1.10
+        - ip addr add 10.20.0.254/24 dev eth1.20
+        # Enable IP forwarding
+        - sysctl -w net.ipv4.ip_forward=1
+
+    host-v10:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip addr add 10.10.0.1/24 dev eth1
+        - ip link set eth1 up
+        - ip route add default via 10.10.0.254
+
+    host-v20:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip addr add 10.20.0.1/24 dev eth1
+        - ip link set eth1 up
+        - ip route add default via 10.20.0.254
+
+  links:
+    - endpoints: ["host-v10:eth1",  "sw1:eth1"]
+    - endpoints: ["host-v20:eth1",  "sw1:eth2"]
+    # Trunk: switch eth3 <-> router eth1
+    - endpoints: ["sw1:eth3", "router1:eth1"]
+
+# -------------------------------------------------------------
+# EXERCISES
+# -------------------------------------------------------------
+# 1. Ping across VLANs (now works via router!):
+#      docker exec clab-lab3-1-intervlan-host-v10 ping 10.20.0.1
+#
+# 2. Trace the path — notice it goes through 10.10.0.254 (router):
+#      docker exec clab-lab3-1-intervlan-host-v10 traceroute 10.20.0.1
+#
+# 3. View routing table on router1:
+#      docker exec -it clab-lab3-1-intervlan-router1 ip route show
+#
+# 4. Watch tagged frames enter the router on the trunk:
+#      docker exec -it clab-lab3-1-intervlan-router1 \
+#        tcpdump -i eth1 -n -e vlan
+#
+# 5. Check subinterface addresses:
+#      docker exec -it clab-lab3-1-intervlan-router1 ip addr show

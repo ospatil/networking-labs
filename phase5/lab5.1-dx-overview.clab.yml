@@ -1,0 +1,127 @@
+# Lab 5.1 — Direct Connect Architecture Overview
+#
+# This is a minimal "connectivity test" topology — no BGP yet.
+# Goal: get familiar with the component names and wiring before
+# adding VLANs and BGP in labs 5.2–5.5.
+#
+# Topology (all nodes connected in a line, L2 only):
+#
+#  [customer-router] --- [dx-crossconnect] --- [aws-edge] --- [vgw] --- [vpc-subnet]
+#
+# Every node just proves reachability to its immediate neighbour.
+# Read the AWS concept mapping table in the exercises below.
+#
+# Deploy: sudo containerlab deploy -t lab5.1-dx-overview.clab.yml
+
+name: lab5-1-dx-overview
+
+topology:
+  nodes:
+    # Customer premises router (CPE)
+    # Real world: your Cisco/Juniper/Arista at the colocation cage
+    customer-router:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip link set eth1 up
+        - ip addr add 10.1.1.1/30 dev eth1
+        - ip route add 10.0.0.0/8 via 10.1.1.2
+
+    # Direct Connect cross-connect / meet-me-room
+    # Real world: the physical fibre patched between your cage and AWS cage
+    # No IP config — purely L2 pass-through
+    dx-crossconnect:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip link set eth1 up
+        - ip link set eth2 up
+        - ip addr add 10.1.1.2/30 dev eth1   # faces customer
+        - ip addr add 10.1.2.1/30 dev eth2   # faces AWS edge
+
+    # AWS edge router (DX endpoint)
+    # Real world: AWS-managed router at the DX location, terminates your VIF
+    aws-edge:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip link set eth1 up
+        - ip link set eth2 up
+        - ip addr add 10.1.2.2/30 dev eth1   # faces DX cross-connect
+        - ip addr add 10.1.3.1/30 dev eth2   # faces VGW (internal AWS)
+        - sysctl -w net.ipv4.ip_forward=1
+
+    # Virtual Private Gateway (VGW)
+    # Real world: AWS-managed gateway attached to your VPC
+    # Terminates the BGP session from your VIF and injects routes into VPC
+    vgw:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip link set eth1 up
+        - ip link set eth2 up
+        - ip addr add 10.1.3.2/30 dev eth1   # faces AWS edge
+        - ip addr add 10.0.0.254/24 dev eth2 # VPC subnet gateway
+        - sysctl -w net.ipv4.ip_forward=1
+
+    # EC2 instance inside the VPC
+    ec2:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip link set eth1 up
+        - ip addr add 10.0.0.10/24 dev eth1
+        - ip route add default via 10.0.0.254
+
+  links:
+    - endpoints: ["customer-router:eth1", "dx-crossconnect:eth1"]
+    - endpoints: ["dx-crossconnect:eth2", "aws-edge:eth1"]
+    - endpoints: ["aws-edge:eth2",        "vgw:eth1"]
+    - endpoints: ["vgw:eth2",             "ec2:eth1"]
+
+# -------------------------------------------------------------
+# AWS DIRECT CONNECT — CONCEPT MAPPING TABLE
+# -------------------------------------------------------------
+#
+# Lab node          │ Real AWS component         │ Notes
+# ──────────────────┼────────────────────────────┼─────────────────────────────
+# customer-router   │ Customer router (CPE)       │ Your hardware or VM
+# dx-crossconnect   │ DX location cross-connect  │ Physical fibre, no config
+# aws-edge          │ AWS DX endpoint router      │ AWS-managed, you don't touch
+# vgw               │ Virtual Private Gateway     │ Attached to your VPC
+# ec2               │ EC2 instance                │ Private subnet, no public IP
+#
+# Connection types you'll add in later labs:
+#   VLAN subinterface on trunk = Virtual Interface (VIF)
+#   Private VIF (Lab 5.2)  → routes to VPC private IPs
+#   Public VIF  (Lab 5.3)  → routes to AWS public service IPs
+#   Transit VIF (Lab 5.4)  → routes to Transit Gateway (multiple VPCs)
+#
+# BGP peering IPs:
+#   AWS always uses 169.254.x.x/30 link-local addresses on VIF BGP sessions
+#   You pick the /30 from the 169.254.0.0/16 range when creating the VIF
+#
+# -------------------------------------------------------------
+# EXERCISES
+# -------------------------------------------------------------
+# 1. Verify each hop is reachable from customer-router:
+#      docker exec clab-lab5-1-dx-overview-customer-router ping 10.1.1.2  # DX cross-connect
+#      docker exec clab-lab5-1-dx-overview-customer-router ping 10.1.2.2  # AWS edge (needs routing)
+#
+# 2. Add a static route on customer-router to reach the VPC:
+#      docker exec clab-lab5-1-dx-overview-customer-router \
+#        ip route add 10.0.0.0/24 via 10.1.1.2
+#
+# 3. Add static routes on dx-crossconnect and aws-edge to complete the path:
+#      docker exec clab-lab5-1-dx-overview-dx-crossconnect \
+#        ip route add 10.0.0.0/24 via 10.1.2.2
+#
+# 4. Full end-to-end ping (customer → EC2) with static routes:
+#      docker exec clab-lab5-1-dx-overview-customer-router ping 10.0.0.10
+#
+# 5. Key insight: static routes work but don't scale.
+#    Labs 5.2+ replace these with BGP — dynamic, resilient, production-grade.
+#
+# 6. Draw the topology on paper before moving to lab 5.2.
+#    Label each link with: protocol used, VLAN ID (none yet), BGP ASN (none yet).
+#    You'll fill those in as you progress.

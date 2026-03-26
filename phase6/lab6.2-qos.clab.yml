@@ -1,0 +1,122 @@
+# Lab 6.2 — QoS and Traffic Shaping over DX
+#
+# Real DX connections support DSCP-based QoS. AWS honours DSCP markings
+# for traffic prioritisation within the DX port speed.
+#
+# This lab demonstrates:
+#   1. DSCP marking at ingress (on-prem router marks traffic)
+#   2. Traffic classification and queuing (tc/iptables)
+#   3. Rate limiting to simulate DX port speed (1Gbps, 10Gbps etc.)
+#   4. Priority queuing — high-priority traffic passes during congestion
+#
+# DSCP classes used (AWS DX supported values):
+#   CS0  (DSCP 0)  — Best effort (default)
+#   AF11 (DSCP 10) — Low priority data
+#   AF21 (DSCP 18) — Bulk data (S3 backups)
+#   AF31 (DSCP 26) — Business-critical apps
+#   CS5  (DSCP 40) — Voice/video signalling
+#   EF   (DSCP 46) — Expedited Forwarding (VoIP, real-time)
+#
+# Deploy: sudo containerlab deploy -t lab6.2-qos.clab.yml
+
+name: lab6-2-qos
+
+topology:
+  nodes:
+    # On-prem host generating different traffic types
+    on-prem-host:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip link set eth1 up
+        - ip addr add 10.100.0.10/24 dev eth1
+        - ip route add default via 10.100.0.254
+        # iperf3 clients will run manually in exercises
+
+    # On-prem router that marks DSCP and applies shaping
+    on-prem-router:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip link set eth1 up   # to on-prem hosts
+        - ip link set eth2 up   # to DX / AWS
+        - ip addr add 10.100.0.254/24 dev eth1
+        - ip addr add 10.1.0.1/30 dev eth2
+        - sysctl -w net.ipv4.ip_forward=1
+        #
+        # --- DSCP MARKING (iptables MARK → tc) ---
+        # Mark VoIP traffic (UDP 5060 SIP + UDP 10000-20000 RTP) as EF (DSCP 46)
+        - iptables -t mangle -A FORWARD -p udp --dport 5060 -j DSCP --set-dscp 46
+        - iptables -t mangle -A FORWARD -p udp --dport 10000:20000 -j DSCP --set-dscp 46
+        # Mark backup traffic (TCP 873 rsync / TCP 443 HTTPS bulk) as AF21
+        - iptables -t mangle -A FORWARD -p tcp --dport 873 -j DSCP --set-dscp 18
+        # Mark business apps (TCP 8080) as AF31
+        - iptables -t mangle -A FORWARD -p tcp --dport 8080 -j DSCP --set-dscp 26
+        #
+        # --- RATE LIMITING with tc (simulate 100Mbps DX port) ---
+        # Create HTB (Hierarchical Token Bucket) qdisc on WAN interface
+        - tc qdisc add dev eth2 root handle 1: htb default 30
+        # Total port speed: 100mbit (simulating a 100Mbps DX)
+        - tc class add dev eth2 parent 1: classid 1:1 htb rate 100mbit
+        # EF class: 30Mbit guaranteed, 50Mbit burst (VoIP/real-time)
+        - tc class add dev eth2 parent 1:1 classid 1:10 htb rate 30mbit ceil 50mbit prio 1
+        # AF31 class: 40Mbit guaranteed (business apps)
+        - tc class add dev eth2 parent 1:1 classid 1:20 htb rate 40mbit ceil 80mbit prio 2
+        # Default class: 10Mbit guaranteed, can borrow up to 100mbit
+        - tc class add dev eth2 parent 1:1 classid 1:30 htb rate 10mbit ceil 100mbit prio 3
+        # Classify by DSCP
+        - tc filter add dev eth2 parent 1: protocol ip u32 match ip dsfield 0xb8 0xfc classid 1:10
+        - tc filter add dev eth2 parent 1: protocol ip u32 match ip dsfield 0x68 0xfc classid 1:20
+
+    # Simulated AWS side — just needs to receive and respond
+    aws-endpoint:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip link set eth1 up
+        - ip addr add 10.1.0.2/30 dev eth1
+        - ip addr add 10.0.0.10/24 dev lo
+        - ip link set lo up
+        - ip route add 10.100.0.0/24 via 10.1.0.1
+        # Start iperf3 servers for testing
+        - iperf3 -s -p 5201 -D
+        - iperf3 -s -p 5202 -D
+
+  links:
+    - endpoints: ["on-prem-host:eth1",   "on-prem-router:eth1"]
+    - endpoints: ["on-prem-router:eth2", "aws-endpoint:eth1"]
+
+# -------------------------------------------------------------
+# EXERCISES
+# -------------------------------------------------------------
+#
+# SETUP: Open 3 terminals, shell into on-prem-host in each
+#   docker exec -it clab-lab6-2-qos-on-prem-host bash
+#
+# 1. VIEW the QoS policy on the router:
+#      docker exec clab-lab6-2-qos-on-prem-router tc -s class show dev eth2
+#
+# 2. Generate BULK (best-effort) traffic that fills the link:
+#    Terminal 1 — start bulk flood:
+#      iperf3 -c 10.0.0.10 -p 5201 -t 60 -b 100M
+#
+# 3. While bulk is running, start "VoIP" traffic in Terminal 2:
+#      iperf3 -c 10.0.0.10 -p 5202 -t 30 -u -b 5M -S 0xb8
+#    (-S 0xb8 = DSCP EF = 46 << 2 = 184 = 0xb8)
+#
+# 4. Observe: EF (VoIP) traffic gets its guaranteed 30Mbit even though
+#    bulk is trying to use 100Mbit. Check stats:
+#      docker exec clab-lab6-2-qos-on-prem-router tc -s class show dev eth2
+#
+# 5. Check DSCP markings are applied (on the router WAN interface):
+#      docker exec clab-lab6-2-qos-on-prem-router \
+#        tcpdump -i eth2 -n -v ip | grep "tos"
+#    Look for "tos 0xb8" (EF) on VoIP packets
+#
+# 6. View iptables mangle counters to confirm marking is happening:
+#      docker exec clab-lab6-2-qos-on-prem-router \
+#        iptables -t mangle -L FORWARD -v -n
+#
+# 7. AWS DSCP NOTE: In real DX, AWS honours DSCP for inbound traffic
+#    (customer → AWS) and marks outbound traffic (AWS → customer)
+#    using its own DSCP policy. The marking at the CPE is YOUR responsibility.

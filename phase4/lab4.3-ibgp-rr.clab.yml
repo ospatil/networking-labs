@@ -1,0 +1,176 @@
+# Lab 4.3 — iBGP and Route Reflectors
+#
+# Topology: 4 routers all in AS 65000 (iBGP).
+# Part A: Full mesh iBGP (every router peers with every other = 6 sessions)
+# Part B: Route Reflector (rr1 reflects routes, only 3 sessions needed)
+#
+# Full mesh:        Route Reflector:
+#  r1─r2            r1──rr1──r3
+#  |X |      →      r2──╯   r4
+#  r3─r4
+#
+# iBGP rule: routes learned from iBGP peer are NOT re-advertised to other
+# iBGP peers. Route Reflector breaks this rule intentionally for scalability.
+#
+# Deploy: sudo containerlab deploy -t lab4.3-ibgp-rr.clab.yml
+
+name: lab4-3-ibgp-rr
+
+topology:
+  nodes:
+    # Route Reflector — central hub of the iBGP topology
+    rr1:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - ibgp-configs/rr1.conf:/etc/frr/frr.conf
+        - daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up
+        - ip link set eth2 up
+        - ip link set eth3 up
+        - ip link set eth4 up
+        - ip addr add 10.0.0.1/30  dev eth1   # link to r1
+        - ip addr add 10.0.0.5/30  dev eth2   # link to r2
+        - ip addr add 10.0.0.9/30  dev eth3   # link to r3
+        - ip addr add 10.0.0.13/30 dev eth4   # link to r4
+        - ip addr add 10.255.0.1/32 dev lo    # loopback = router-id
+        - ip link set lo up
+        - sysctl -w net.ipv4.ip_forward=1
+
+    r1:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - ibgp-configs/r1.conf:/etc/frr/frr.conf
+        - daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up
+        - ip addr add 10.0.0.2/30  dev eth1   # link to rr1
+        - ip addr add 10.255.0.11/32 dev lo
+        - ip addr add 192.168.11.0/24 dev lo  # local prefix to advertise
+        - ip link set lo up
+        - sysctl -w net.ipv4.ip_forward=1
+
+    r2:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - ibgp-configs/r2.conf:/etc/frr/frr.conf
+        - daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up
+        - ip addr add 10.0.0.6/30  dev eth1   # link to rr1
+        - ip addr add 10.255.0.12/32 dev lo
+        - ip addr add 192.168.12.0/24 dev lo
+        - ip link set lo up
+        - sysctl -w net.ipv4.ip_forward=1
+
+    r3:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - ibgp-configs/r3.conf:/etc/frr/frr.conf
+        - daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up
+        - ip addr add 10.0.0.10/30 dev eth1   # link to rr1
+        - ip addr add 10.255.0.13/32 dev lo
+        - ip addr add 192.168.13.0/24 dev lo
+        - ip link set lo up
+        - sysctl -w net.ipv4.ip_forward=1
+
+    r4:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - ibgp-configs/r4.conf:/etc/frr/frr.conf
+        - daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up
+        - ip addr add 10.0.0.14/30 dev eth1   # link to rr1
+        - ip addr add 10.255.0.14/32 dev lo
+        - ip addr add 192.168.14.0/24 dev lo
+        - ip link set lo up
+        - sysctl -w net.ipv4.ip_forward=1
+
+  links:
+    - endpoints: ["rr1:eth1", "r1:eth1"]
+    - endpoints: ["rr1:eth2", "r2:eth1"]
+    - endpoints: ["rr1:eth3", "r3:eth1"]
+    - endpoints: ["rr1:eth4", "r4:eth1"]
+
+# -------------------------------------------------------------
+# EXERCISES
+# -------------------------------------------------------------
+# 1. Verify all 4 iBGP sessions on rr1:
+#      docker exec -it clab-lab4-3-ibgp-rr-rr1 \
+#        vtysh -c "show bgp summary"
+#    All 4 clients should show "Established"
+#
+# 2. Check that r1 can see prefixes from r3 and r4 (reflected by rr1):
+#      docker exec -it clab-lab4-3-ibgp-rr-r1 \
+#        vtysh -c "show bgp ipv4 unicast"
+#    Without RR, r1 would only see routes directly from rr1.
+#    With RR, r1 sees 192.168.12.0/24, 192.168.13.0/24, 192.168.14.0/24.
+#
+# 3. Check ORIGINATOR_ID and CLUSTER_LIST attributes on reflected routes:
+#      docker exec -it clab-lab4-3-ibgp-rr-r1 \
+#        vtysh -c "show bgp ipv4 unicast 192.168.13.0/24"
+#    These attributes are added by the RR and prevent routing loops.
+#
+# 4. Understand iBGP vs eBGP next-hop behaviour:
+#      docker exec -it clab-lab4-3-ibgp-rr-r1 \
+#        vtysh -c "show bgp ipv4 unicast 192.168.12.0/24"
+#    The NEXT_HOP is r2's address — NOT rr1's address.
+#    In iBGP, next-hop is preserved (not changed like in eBGP).
+#    This is why you need IGP reachability to all next-hops in a real network.
+#
+# EXPERIMENT A — Demonstrate the iBGP non-propagation rule (WHY we need RR)
+# Without route reflector, r1 cannot propagate routes to r2 via rr1.
+# This lab already has RR enabled — first OBSERVE it working, then break it.
+#
+# 5. Confirm r1 SEES routes from r3 (reflected by rr1):
+#      docker exec -it clab-lab4-3-ibgp-rr-r1 \
+#        vtysh -c "show bgp ipv4 unicast 192.168.13.0/24"
+#
+# EXPERIMENT B — iBGP next-hop behaviour (critical concept)
+# In iBGP, the NEXT_HOP attribute is NOT changed when reflecting routes.
+# This means r1 sees r3's next-hop as r3's own IP (10.0.0.10).
+# But r1 only has a direct link to rr1 (10.0.0.1) — it has NO route to 10.0.0.10!
+# In a real network this is solved by running IGP (OSPF/ISIS) alongside iBGP.
+# Here, the /30 subnets provide reachability since all routers connect to rr1.
+#
+# 5. Observe the next-hop on a reflected route:
+#      docker exec -it clab-lab4-3-ibgp-rr-r1 \
+#        vtysh -c "show bgp ipv4 unicast 192.168.13.0/24"
+#    The Next Hop field shows r3's address (10.0.0.10), NOT rr1's address.
+#
+# 6. Confirm r1 can actually reach that next-hop (it can, via direct /30):
+#      docker exec clab-lab4-3-ibgp-rr-r1 ping 10.0.0.10
+#    In a real multi-hop iBGP network this would fail without an IGP.
+#    Fix: add "neighbor <IP> next-hop-self" on rr1 to rewrite next-hops:
+#      docker exec -it clab-lab4-3-ibgp-rr-rr1 vtysh
+#      conf t
+#      router bgp 65000
+#       address-family ipv4 unicast
+#        neighbor 10.0.0.2 next-hop-self   ← tells r1 "use ME as next-hop"
+#      end
+#      clear bgp ipv4 unicast 10.0.0.2 soft out
+#    Re-check: next-hop for 192.168.13.0/24 on r1 is now rr1's IP (10.0.0.1).
+#
+# EXPERIMENT C — disable route-reflector-client on one peer:
+# 7. Remove r4 from the RR client group:
+#      docker exec -it clab-lab4-3-ibgp-rr-rr1 vtysh
+#      conf t
+#      router bgp 65000
+#       address-family ipv4 unicast
+#        no neighbor 10.0.0.14 route-reflector-client
+#      end
+#      clear bgp ipv4 unicast 10.0.0.14 soft
+#
+# 8. r4 now receives routes but they are NOT reflected to other clients:
+#      docker exec -it clab-lab4-3-ibgp-rr-r1 \
+#        vtysh -c "show bgp ipv4 unicast 192.168.14.0/24"
+#    192.168.14.0/24 disappears from r1's table!
+#    This illustrates the iBGP non-propagation rule.

@@ -1,0 +1,135 @@
+# Lab 6.1 — ECMP and Load Balancing over DX
+#
+# Equal-Cost Multi-Path (ECMP): on-prem has TWO equal-cost paths to the VPC.
+# Unlike lab 5.5 (active/passive), here BOTH paths are active simultaneously
+# and traffic is distributed across them.
+#
+# Topology:
+#
+#  [on-prem-router] ─── path-A (VLAN 100) ──> [aws-edge-1] ──┐
+#                   \                                          ├──> [tgw/vgw] --> [ec2]
+#                    └── path-B (VLAN 100) ──> [aws-edge-2] ──┘
+#
+# Both paths use the SAME prefix with the SAME AS-PATH length → ECMP
+# BGP multipath must be enabled: "maximum-paths 2"
+#
+# Deploy: sudo containerlab deploy -t lab6.1-ecmp.clab.yml
+
+name: lab6-1-ecmp
+
+topology:
+  nodes:
+    on-prem-router:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - configs/on-prem-ecmp.conf:/etc/frr/frr.conf
+        - configs/daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up
+        - ip link set eth2 up
+        - ip link add link eth1 name eth1.100 type vlan id 100
+        - ip link add link eth2 name eth2.100 type vlan id 100
+        - ip link set eth1.100 up
+        - ip link set eth2.100 up
+        - ip addr add 169.254.10.1/30 dev eth1.100
+        - ip addr add 169.254.20.1/30 dev eth2.100
+        - ip addr add 10.100.0.0/24 dev lo
+        - ip link set lo up
+        - sysctl -w net.ipv4.ip_forward=1
+
+    aws-edge-1:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - configs/aws-edge-1-ecmp.conf:/etc/frr/frr.conf
+        - configs/daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up
+        - ip link set eth2 up
+        - ip link add link eth1 name eth1.100 type vlan id 100
+        - ip link set eth1.100 up
+        - ip addr add 169.254.10.2/30 dev eth1.100
+        - ip addr add 10.200.0.1/30 dev eth2
+        - sysctl -w net.ipv4.ip_forward=1
+
+    aws-edge-2:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - configs/aws-edge-2-ecmp.conf:/etc/frr/frr.conf
+        - configs/daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up
+        - ip link set eth2 up
+        - ip link add link eth1 name eth1.100 type vlan id 100
+        - ip link set eth1.100 up
+        - ip addr add 169.254.20.2/30 dev eth1.100
+        - ip addr add 10.200.1.1/30 dev eth2
+        - sysctl -w net.ipv4.ip_forward=1
+
+    vpc-gw:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - configs/vpc-gw-ecmp.conf:/etc/frr/frr.conf
+        - configs/daemons:/etc/frr/daemons
+      exec:
+        - ip link set eth1 up
+        - ip link set eth2 up
+        - ip link set eth3 up
+        - ip addr add 10.200.0.2/30 dev eth1
+        - ip addr add 10.200.1.2/30 dev eth2
+        - ip addr add 10.0.0.254/24 dev eth3
+        - sysctl -w net.ipv4.ip_forward=1
+
+    ec2:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip link set eth1 up
+        - ip addr add 10.0.0.10/24 dev eth1
+        - ip route add default via 10.0.0.254
+        - iperf3 -s -D   # iperf3 server for bandwidth testing
+
+  links:
+    - endpoints: ["on-prem-router:eth1", "aws-edge-1:eth1"]
+    - endpoints: ["on-prem-router:eth2", "aws-edge-2:eth1"]
+    - endpoints: ["aws-edge-1:eth2",     "vpc-gw:eth1"]
+    - endpoints: ["aws-edge-2:eth2",     "vpc-gw:eth2"]
+    - endpoints: ["vpc-gw:eth3",         "ec2:eth1"]
+
+# -------------------------------------------------------------
+# EXERCISES
+# -------------------------------------------------------------
+# 1. Verify BOTH BGP sessions are Established:
+#      docker exec -it clab-lab6-1-ecmp-on-prem-router \
+#        vtysh -c "show bgp summary"
+#
+# 2. Check ECMP routes on on-prem-router — should see TWO next-hops for VPC:
+#      docker exec -it clab-lab6-1-ecmp-on-prem-router \
+#        vtysh -c "show ip route 10.0.0.0/24"
+#    Look for "multipath" or two equal-cost BGP routes
+#
+# 3. Check ECMP routes on vpc-gw — TWO paths back to on-prem:
+#      docker exec -it clab-lab6-1-ecmp-vpc-gw \
+#        vtysh -c "show ip route 10.100.0.0/24"
+#
+# 4. Run iperf3 to generate traffic, then observe ECMP distribution:
+#      # In one terminal, start traffic:
+#      docker exec clab-lab6-1-ecmp-on-prem-router \
+#        iperf3 -c 10.0.0.10 -t 30 -P 8
+#
+#      # In another terminal, watch packet counts per interface:
+#      docker exec clab-lab6-1-ecmp-on-prem-router \
+#        watch -n1 "ip -s link show eth1.100 && ip -s link show eth2.100"
+#
+# 5. Simulate one path failing — traffic moves entirely to remaining path:
+#      docker stop clab-lab6-1-ecmp-aws-edge-1
+#      docker exec clab-lab6-1-ecmp-on-prem-router \
+#        vtysh -c "show ip route 10.0.0.0/24"
+#    Now only ONE next-hop remains (failover, not ECMP)
+#
+# 6. KEY CONCEPT: ECMP hash — Linux hashes on src/dst IP+port by default.
+#    Same flow always takes the same path. To see multi-flow distribution,
+#    use multiple parallel iperf3 streams (-P 8 flag above).

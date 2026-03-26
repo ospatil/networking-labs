@@ -1,0 +1,12 @@
+! FRR Configuration — Lab 4.2: BGP Attributes & Path Selection
+! Three AS topology: AS65001 <-> AS65002 <-> AS65003
+!                              AS65001 <-> AS65003 (via backup path)
+!
+! Topology:
+!   router-a (AS65001) -- router-b (AS65002) -- router-c (AS65003)
+!         \____________________________________________/
+!                    (backup path, direct)
+!
+! Goal: AS65003 has two paths to 192.168.1.0/24 (in AS65001)
+!       Primary via AS65002, backup direct.
+!       We'll manipulate LOCAL_PREF and AS_PATH prepending.
