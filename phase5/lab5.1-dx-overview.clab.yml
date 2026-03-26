@@ -29,7 +29,8 @@ topology:
 
     # Direct Connect cross-connect / meet-me-room
     # Real world: the physical fibre patched between your cage and AWS cage
-    # No IP config — purely L2 pass-through
+    # In this simplified lab it acts as an L3 hop; lab 5.2 replaces it
+    # with a proper L2 bridge carrying VLAN-tagged traffic.
     dx-crossconnect:
       kind: linux
       image: ghcr.io/hellt/network-multitool

@@ -5,7 +5,9 @@
 
 ---
 
-## 1. Multipass VM Lifecycle
+## 1. Environment Lifecycle
+
+### Multipass (macOS)
 
 ```bash
 # First-time setup (run on your Mac)
@@ -27,11 +29,29 @@ multipass shell clab
 | `multipass info clab` | Show IP, CPU, memory, disk |
 | `multipass delete clab && multipass purge` | Permanently destroy VM |
 
+### EC2
+
+```bash
+# First-time setup (run on the EC2 instance)
+chmod +x setup-ubuntu.sh
+sudo ./setup-ubuntu.sh
+# Log out and back in for docker group to take effect
+```
+
+### Proxmox
+
+```bash
+# First-time setup (run inside the Proxmox VM)
+chmod +x setup-ubuntu.sh
+sudo ./setup-ubuntu.sh
+# Log out and back in for docker group to take effect
+```
+
 ---
 
 ## 2. Containerlab Core Commands
 
-Run all `containerlab` and `docker` commands **inside the Multipass VM**, not on your Mac.
+Run all `containerlab` and `docker` commands **inside the Ubuntu environment**, not on your Mac (if using Multipass).
 
 ```bash
 # Deploy a lab

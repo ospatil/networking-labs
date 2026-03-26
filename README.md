@@ -1,6 +1,6 @@
 # Networking Learning Labs
 
-## From L2 Basics to AWS Direct Connect on macOS with Multipass using ContainerLab
+## From L2 Basics to AWS Direct Connect using ContainerLab
 
 ---
 
@@ -10,66 +10,116 @@
 |---|---|
 | 📋 **[learning-plan.md](learning-plan.md)** | Lab objectives, key concepts, and AWS mappings for each lab |
 | 🗺 **[topologies.md](topologies.md)** | Mermaid topology diagrams for every lab |
-| 📖 **README.md** | ← You are here — VM setup and step-by-step lab commands |
+| 📖 **README.md** | ← You are here — environment setup and step-by-step lab commands |
 
 ---
 
 ## Prerequisites
 
-- **macOS** (Apple Silicon or Intel)
-- **Homebrew** installed
-- **8 GB RAM free** for the VM (16 GB recommended)
+All labs run inside an **Ubuntu 24.04 LTS** environment with:
+
+- **4 vCPUs** (minimum 2)
+- **8 GB RAM** (16 GB recommended)
 - **40 GB disk space**
+
+You can get this environment via any of the options below.
 
 ---
 
-## Step 1 — Install Multipass
+## Environment Setup — Choose One
+
+### Option A: macOS with Multipass (local laptop)
+
+Best for: quick local setup on a Mac.
+
+**Requirements:** macOS (Apple Silicon or Intel), Homebrew installed.
+
+1. Install Multipass:
 
 ```bash
 brew install --cask multipass
 ```
 
-Verify:
-
-```bash
-multipass version
-```
-
----
-
-## Step 2 — Create the Lab VM
-
-Run the setup script (takes ~10 minutes):
+2. Run the setup script (creates an Ubuntu 24.04 VM with Docker + Containerlab):
 
 ```bash
 chmod +x setup-multipass.sh
 ./setup-multipass.sh
 ```
 
-This creates an Ubuntu LTS VM named `clab` with:
-
-- 4 vCPUs, 8 GB RAM, 40 GB disk
-- Docker + Containerlab installed
-- FRR, multitool, and Alpine images pre-pulled
-- Network tools: tcpdump, tshark, bridge-utils, iperf3, tmux
-
----
-
-## Step 3 — Copy Lab Files into the VM
+3. Copy lab files into the VM:
 
 ```bash
 multipass transfer -r ./networking-labs clab:/home/ubuntu/
 ```
 
----
-
-## Step 4 — Access the VM
+4. Access the VM:
 
 ```bash
 multipass shell clab
 ```
 
-You are now inside the Ubuntu VM. All `containerlab` and `docker` commands run here.
+### Option B: Amazon EC2 (cloud)
+
+Best for: no local resources needed, accessible from anywhere.
+
+> **Note:** Containerlab uses Docker containers, not nested VMs, so you do NOT need bare-metal or nested virtualization support. A regular `t3.xlarge` (4 vCPU, 16 GB) works fine.
+
+1. Launch an **Ubuntu 24.04 LTS** instance (`t3.xlarge` or larger, 40 GB gp3 root volume).
+
+2. SSH in and clone the repo:
+
+```bash
+ssh ubuntu@<instance-ip>
+git clone <your-repo-url> networking-labs
+cd networking-labs
+```
+
+3. Run the setup script:
+
+```bash
+chmod +x setup-ubuntu.sh
+sudo ./setup-ubuntu.sh
+```
+
+4. Log out and back in (so the docker group takes effect):
+
+```bash
+exit
+ssh ubuntu@<instance-ip>
+```
+
+### Option C: Proxmox (home lab)
+
+Best for: dedicated lab environment on a mini-PC or server.
+
+1. Create an Ubuntu 24.04 LTS VM in Proxmox (4 vCPU, 8 GB RAM, 40 GB disk).
+
+2. SSH in and clone the repo:
+
+```bash
+ssh user@<vm-ip>
+git clone <your-repo-url> networking-labs
+cd networking-labs
+```
+
+3. Run the setup script:
+
+```bash
+chmod +x setup-ubuntu.sh
+sudo ./setup-ubuntu.sh
+```
+
+4. Log out and back in (so the docker group takes effect):
+
+```bash
+exit
+ssh user@<vm-ip>
+```
+
+---
+
+After setup, you are inside an Ubuntu environment. All `containerlab` and `docker` commands run here.
 
 ---
 
@@ -78,6 +128,7 @@ You are now inside the Ubuntu VM. All `containerlab` and `docker` commands run h
 ```sh
 networking-labs/
 ├── setup-multipass.sh          ← Run this on your Mac first
+├── setup-ubuntu.sh             ← Run this on EC2 / Proxmox / any Ubuntu
 ├── CHEATSHEET.md               ← Quick command reference
 ├── README.md                   ← This file
 │
@@ -91,28 +142,35 @@ networking-labs/
 │
 ├── phase3/                     ← Layer 3 Routing & ENI Concepts
 │   ├── lab3.1-intervlan.clab.yml
+│   ├── lab3.2-svi.clab.yml
 │   └── lab3.3-eni.clab.yml
 │
 ├── phase4/                     ← BGP Fundamentals
 │   ├── lab4.1-bgp-basic.clab.yml
+│   ├── lab4.2-bgp-attributes.clab.yml
+│   ├── lab4.3-ibgp-rr.clab.yml
 │   ├── router-a-frr.conf
 │   ├── router-b-frr.conf
 │   └── daemons
 │
-└── phase5/                     ← AWS Direct Connect Simulation
-    ├── lab5.2-private-vif.clab.yml
-    ├── lab5.5-dx-advanced.clab.yml
-    ├── lab5.6-eni-vpc.clab.yml
-    ├── configs/
-    │   ├── on-prem-router.conf
-    │   ├── aws-edge-router.conf
-    │   ├── vpc-gateway.conf
-    │   └── daemons
-    └── advanced-configs/
-        ├── on-prem-dual.conf
-        ├── aws-edge-1.conf
-        ├── aws-edge-2.conf
-        └── vpc-gw-dual.conf
+├── phase5/                     ← AWS Direct Connect Simulation
+│   ├── lab5.1-dx-overview.clab.yml
+│   ├── lab5.2-private-vif.clab.yml
+│   ├── lab5.3-public-vif.clab.yml
+│   ├── lab5.4-transit-vif.clab.yml
+│   ├── lab5.5-dx-advanced.clab.yml
+│   ├── lab5.6-eni-vpc.clab.yml
+│   ├── configs/
+│   ├── advanced-configs/
+│   ├── pub-configs/
+│   └── tgw-configs/
+│
+└── phase6/                     ← Advanced Topics
+    ├── lab6.1-ecmp.clab.yml
+    ├── lab6.2-qos.clab.yml
+    ├── lab6.3-troubleshooting.clab.yml
+    ├── lab6.4-advanced-eni.clab.yml
+    └── configs/
 ```
 
 ---
@@ -892,9 +950,20 @@ multipass stop clab
 # Resize requires recreating the VM — plan 40GB+ upfront
 ```
 
+### EC2 instance ran out of disk
+
+Expand the EBS volume in the AWS Console, then grow the filesystem:
+
+```bash
+sudo growpart /dev/nvme0n1 1
+sudo resize2fs /dev/nvme0n1p1
+```
+
 ---
 
 ## VM Lifecycle
+
+### Multipass (macOS)
 
 ```bash
 # Suspend VM when not in use (saves RAM):
@@ -905,4 +974,23 @@ multipass start clab && multipass shell clab
 
 # Full cleanup:
 multipass delete clab && multipass purge
+```
+
+### EC2
+
+```bash
+# Stop instance (no compute charges while stopped):
+aws ec2 stop-instances --instance-ids <instance-id>
+
+# Start again:
+aws ec2 start-instances --instance-ids <instance-id>
+```
+
+### Proxmox
+
+Use the Proxmox web UI or `qm` CLI:
+
+```bash
+qm shutdown <vmid>
+qm start <vmid>
 ```

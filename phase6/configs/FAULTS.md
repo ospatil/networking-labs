@@ -18,6 +18,10 @@
 #   Fix: change to network 10.0.0.0/24 AND add the /24 to the loopback interface
 #   Symptom: BGP session up, aws-edge receives no VPC prefix from vpc-gw
 #
-# FAULT 4 — ip_forward disabled on aws-edge
-#   Not in FRR config — in the exec section. Remove the sysctl line and redeploy.
+# FAULT 4 — ip_forward disabled on aws-edge (BONUS — not pre-injected)
+#   Unlike faults 1-3, this one is NOT broken in the deployed topology.
+#   The exec section enables ip_forward. To practice this fault, manually
+#   disable it after deploy:
+#     docker exec clab-lab6-3-troubleshoot-aws-edge sysctl -w net.ipv4.ip_forward=0
 #   Symptom: BGP works, routes installed everywhere, but ping through aws-edge fails
+#   Fix: sysctl -w net.ipv4.ip_forward=1
